@@ -1,69 +1,72 @@
-// avatar-backend/app.js (or server.js)
+// avatar-backend/app.js
 require('dotenv').config();
-const express = require('express'); 
+const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
-const url = require('url'); // Import the URL module to parse paths
 
-const { handleRealtimeVoiceChat } = require('./ws/handler');
-const apiRoutes = require('./routes');
-const { handleStripeWebhook } = require('./controllers/stripeController');
+const mainRouter = require('./routes/index'); // Import your main router
+const { handleTextChat } = require('./ws/chatHandler');
+const { handleVoiceChat } = require('./ws/voiceChatHandler');
 
-const app = express(); 
-const PORT = process.env.PORT || 5000;
+const app = express();
+const port = process.env.PORT || 5000;
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true }); // Important: noServer to handle upgrades manually
-
+// Middleware
 app.use(cors());
-
-// --- Stripe Webhook Endpoint (MUST be before express.json()) ---
-// app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
-
-// --- Apply global JSON body parser for most API routes ---
 app.use(express.json());
 
-// --- API Routes ---
-app.use('/api', apiRoutes);
+// Routes
+app.use('/api', mainRouter); // Use the main router to include all your API routes
 
-// --- WebSocket Connection Handling ---
-// wss.on('connection', (ws, req) => {
-//     console.log('Client connected to WebSocket for real-time chat');
-//     handleRealtimeVoiceChat(ws, req);
-// });
+// Create HTTP server
+const server = http.createServer(app);
 
+// Create WebSocket server attached to the HTTP server
+const wss = new WebSocket.Server({ noServer: true });
 
-// --- WebSocket Upgrade Handling ---
+// Handle WebSocket upgrade requests
 server.on('upgrade', function upgrade(request, socket, head) {
-    const pathname = url.parse(request.url).pathname;
+    const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+    console.log(`WebSocket upgrade request for path: ${pathname}`);
 
-    if (pathname === '/ws/chat' || pathname === '/chat') { // Handle both /ws/chat and /chat for flexibility
+    if (pathname === '/chat') {
         wss.handleUpgrade(request, socket, head, function done(ws) {
-            console.log('Client connected to WebSocket for real-time chat (Path: /chat)');
-            handleRealtimeVoiceChat(ws, request); // Pass the original request to the handler
+            wss.emit('connection', ws, request, pathname);
         });
-    } else if (pathname === '/ws/audio-call' || pathname === '/audio-call') {
+    } else if (pathname === '/voice-chat') {
         wss.handleUpgrade(request, socket, head, function done(ws) {
-            console.log('Client connected to WebSocket for audio call (Path: /audio-call)');
-            // For now, let handleRealtimeVoiceChat handle this too,
-            // but in a real app, you'd have a specific audio call handler here.
-            handleRealtimeVoiceChat(ws, request); // Can reuse for now, but will need adaptation
+            wss.emit('connection', ws, request, pathname);
         });
-    } else if (pathname === '/ws/video-call' || pathname === '/video-call') {
+    } else if (pathname === '/video-call') {
+        // Handle video call WebSocket here (placeholder for future implementation)
         wss.handleUpgrade(request, socket, head, function done(ws) {
-            console.log('Client connected to WebSocket for video call (Path: /video-call)');
-            // Dedicated video call handler here
-            handleRealtimeVoiceChat(ws, request); // Can reuse for now, but will need adaptation
+            wss.emit('connection', ws, request, pathname);
         });
+        console.log('Video call WebSocket path received, but not fully implemented.');
+        socket.destroy(); // Close for now as not fully implemented
     } else {
-        socket.destroy(); // Reject unknown WebSocket connections
+        console.warn(`Unknown WebSocket path: ${pathname}. Destroying socket.`);
+        socket.destroy();
     }
 });
 
+wss.on('connection', function connection(ws, req, pathname) {
+    console.log(`Client connected to WebSocket (Path: ${pathname})`);
+    if (pathname === '/chat') {
+        handleTextChat(ws, req);
+    } else if (pathname === '/voice-chat') {
+        handleVoiceChat(ws, req);
+    } else if (pathname === '/video-call') {
+        // handleVideoCall(ws, req); // Future video call handler
+        ws.send(JSON.stringify({ type: 'error', message: 'Video call not implemented yet.' }));
+        ws.close();
+    }
+});
 
-// Start the server (listen on the HTTP server, which also handles WebSockets)
-server.listen(PORT, () => {
-    console.log(`Backend server running on port ${PORT}`);
-    console.log(`WebSocket server running on ws://localhost:${PORT}/ws`);
+// Start the server
+server.listen(port, () => {
+    console.log(`Backend server running on port ${port}`);
+    console.log(`WebSocket server running on ws://localhost:${port}/chat`);
+    console.log(`WebSocket server running on ws://localhost:${port}/voice-chat`);
 });

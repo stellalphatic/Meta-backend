@@ -56,7 +56,7 @@ async function handleRealtimeVoiceChat(ws, req) {
         avatarPersonalityData = avatarData.personality_data;
         const voiceCloneUrl = avatarData.voice_url;
 
-        if (!voiceCloneUrl) {
+        if (!voiceCloaneUrl) {
             await ws.send(JSON.stringify({ type: 'error', message: 'Avatar has no voice sample URL configured.' }));
             ws.close();
             return;
