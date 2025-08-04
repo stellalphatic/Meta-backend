@@ -1,6 +1,6 @@
-const express = require('express');
-const { authenticateJWT } = require('../controllers/avatarController'); // Assuming authenticateJWT is in avatarController
-const { createSale, handleWebhook } = require('../controllers/twoCheckoutController');
+import express from 'express';
+import { authenticateJWT } from '../controllers/avatarController.js';
+import { createSale, handleWebhook } from '../controllers/twoCheckoutController.js';
 
 const router = express.Router();
 
@@ -13,4 +13,4 @@ router.post('/create-sale', authenticateJWT, createSale);
 // This is crucial for receiving real-time payment status updates from 2Checkout.
 router.post('/webhook', handleWebhook); // Webhooks usually don't need JWT auth as they come from 2Checkout
 
-module.exports = router;
+export default router; 

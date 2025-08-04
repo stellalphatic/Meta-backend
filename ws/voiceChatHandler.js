@@ -1,7 +1,7 @@
-const WebSocket = require('ws');
-const { getGeminiResponse, saveChatHistory, getAvatarPersonalityFromDB } = require('../services/gemini'); // Import getAvatarPersonalityFromDB
-const { supabaseAdmin } = require('../services/supabase');
-const crypto = require('crypto');
+import WebSocket from 'ws';
+import { getGeminiResponse, saveChatHistory, getAvatarPersonalityFromDB } from '../services/gemini.js'; 
+import { supabaseAdmin } from '../services/supabase.js';
+import crypto from 'crypto';
 
 // Helper function to safely parse incoming WebSocket messages
 function parseIncomingMessage(message) {
@@ -243,4 +243,4 @@ async function handleVoiceChat(ws, req) {
     });
 }
 
-module.exports = { handleVoiceChat };
+export default handleVoiceChat ;

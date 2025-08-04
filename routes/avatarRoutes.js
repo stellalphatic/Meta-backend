@@ -1,6 +1,6 @@
 // avatar-backend/routes/avatarRoutes.js
-const express = require('express');
-const { authenticateJWT, getAvatars, createAvatar, updateAvatar, deleteAvatar } = require('../controllers/avatarController');
+import express from 'express';
+import { authenticateJWT, getAvatars, createAvatar, updateAvatar, deleteAvatar } from '../controllers/avatarController.js';
 
 const router = express.Router();
 
@@ -10,4 +10,4 @@ router.post('/', authenticateJWT, createAvatar);
 router.put('/:id', authenticateJWT, updateAvatar);
 router.delete('/:id', authenticateJWT, deleteAvatar);
 
-module.exports = router;
+export default router; 

@@ -1,13 +1,15 @@
 // avatar-backend/app.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const WebSocket = require('ws');
-const http = require('http');
+// import dotenv from 'dotenv';
+// dotenv.config();
 
-const mainRouter = require('./routes/index'); 
-const { handleTextChat } = require('./ws/chatHandler'); 
-const { handleVoiceChat } = require('./ws/voiceChatHandler');
+import express from 'express';
+import cors from 'cors';
+import WebSocket from 'ws'; 
+import http from 'http';    
+
+import mainRouter from './routes/index.js';
+import  handleTextChat  from './ws/chatHandler.js';
+import  handleVoiceChat  from './ws/voiceChatHandler.js';
 
 const app = express();
 const port = process.env.PORT || 5000;

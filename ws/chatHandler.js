@@ -1,6 +1,6 @@
-const { getGeminiResponse, saveChatHistory } = require('../services/gemini');
-const { supabaseAdmin } = require('../services/supabase');
-const crypto = require('crypto');
+import { getGeminiResponse, saveChatHistory } from '../services/gemini.js';
+import { supabaseAdmin } from '../services/supabase.js';
+import crypto from 'crypto';
 
 async function handleTextChat(ws, req) {
     let userId;
@@ -102,4 +102,4 @@ async function handleTextChat(ws, req) {
     });
 }
 
-module.exports = { handleTextChat };
+export default handleTextChat ;

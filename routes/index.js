@@ -1,12 +1,12 @@
-const express = require('express');
-const avatarRoutes = require('./avatarRoutes');
-const audioGenerationRoutes = require('./audioGenerationRoutes'); 
-const twoCheckoutRoutes = require('./twoCheckoutRoutes'); 
+import express from 'express';
+import avatarRoutes from './avatarRoutes.js'; 
+import audioGenerationRoutes from './audioGenerationRoutes.js'; 
+import twoCheckoutRoutes from './twoCheckoutRoutes.js'; 
 
 const router = express.Router();
 
 router.use('/avatars', avatarRoutes);
-router.use('/audio', audioGenerationRoutes); 
-router.use('/2checkout', twoCheckoutRoutes); 
+router.use('/audio', audioGenerationRoutes);
+router.use('/2checkout', twoCheckoutRoutes);
 
-module.exports = router;
+export default router; 

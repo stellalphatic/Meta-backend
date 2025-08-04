@@ -1,5 +1,5 @@
-const crypto = require('crypto');
-const fetch = require('node-fetch'); // For making HTTP requests
+import crypto from 'crypto';
+import fetch from 'node-fetch'; // 'node-fetch' exports a default function, so no .default needed with ESM
 
 // 2Checkout API credentials from environment variables
 const SELLER_ID = process.env.TWOCHECKOUT_SELLER_ID;
@@ -28,7 +28,7 @@ const generate2CheckoutHash = (date, contentLength, urlPath) => {
  * @param {object} req Express request object.
  * @param {object} res Express response object.
  */
-const createSale = async (req, res) => {
+export const createSale = async (req, res) => { // Changed to named export
     const { amount, currency, customerDetails, productDetails } = req.body; // Example payload
 
     if (!amount || !currency || !customerDetails || !productDetails) {
@@ -116,7 +116,7 @@ const createSale = async (req, res) => {
  * @param {object} req Express request object.
  * @param {object} res Express response object.
  */
-const handleWebhook = async (req, res) => {
+export const handleWebhook = async (req, res) => { // Changed to named export
     // 2Checkout IPN data is typically sent as form-urlencoded or JSON,
     // depending on your IPN settings in the 2Checkout control panel.
     // For this example, we assume it's directly in req.body (parsed by express.json() or express.urlencoded()).
@@ -124,7 +124,7 @@ const handleWebhook = async (req, res) => {
     console.log('[2CHECKOUT WEBHOOK] Received IPN:', ipnData);
 
     // --- 1. Validate the IPN Signature ---
-    const receivedSignature = req.headers['x-twilio-signature'] || req.headers['X-Avangate-Signature']; // Check header or body for signature
+    let receivedSignature = req.headers['x-twilio-signature'] || req.headers['X-Avangate-Signature']; // Check header or body for signature
     if (!receivedSignature && ipnData.HASH) {
         receivedSignature = ipnData.HASH; // Fallback if signature is in body
     }
@@ -184,9 +184,4 @@ const handleWebhook = async (req, res) => {
         // so 2Checkout might retry the webhook.
         res.status(500).send('Internal server error processing webhook');
     }
-};
-
-module.exports = {
-    createSale,
-    handleWebhook
 };

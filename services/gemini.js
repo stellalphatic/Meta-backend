@@ -1,10 +1,10 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { supabaseAdmin } = require('./supabase'); // Assuming supabaseAdmin is configured for direct DB access
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { supabaseAdmin } from '../services/supabase.js';
 
-// Access your API key as an environment variable (ensure it's set in your .env or Cloud Run config)
+
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL_NAME = "gemini-2.0-flash"; // Or "gemini-1.5-flash-latest" for newer models if available and configured
-const MAX_HISTORY_LENGTH = 10; // Keep last 10 messages for context
+const MODEL_NAME = "gemini-2.0-flash"; 
+const MAX_HISTORY_LENGTH = 10; 
 
 const genAI = new GoogleGenerativeAI(API_KEY);
 
@@ -20,7 +20,7 @@ const avatarPersonalityCache = new Map();
  * @param {string} avatarId The ID of the avatar.
  * @returns {Promise<object|null>} The avatar's personality data or null if not found/error.
  */
-async function getAvatarPersonalityFromDB(avatarId) {
+export async function getAvatarPersonalityFromDB(avatarId) { // Changed to named export
     if (avatarPersonalityCache.has(avatarId)) {
         console.log(`[CACHE] Avatar personality data for ${avatarId} found in cache.`);
         return avatarPersonalityCache.get(avatarId);
@@ -30,7 +30,7 @@ async function getAvatarPersonalityFromDB(avatarId) {
     try {
         const { data, error } = await supabaseAdmin
             .from('avatars')
-            .select('system_prompt, persona_role, conversational_context')
+            .select('system_prompt, persona_role, conversational_context, name') // Added 'name' for system instruction
             .eq('id', avatarId)
             .single();
 
@@ -58,7 +58,7 @@ async function getAvatarPersonalityFromDB(avatarId) {
  * @param {string} language The desired response language (e.g., 'en', 'hi').
  * @returns {Promise<string>} The generated Gemini text response.
  */
-async function getGeminiResponse(sessionId, userText, avatarId, language = 'en') {
+export async function getGeminiResponse(sessionId, userText, avatarId, language = 'en') { // Changed to named export
     let chatHistory = chatSessions.get(sessionId);
 
     if (!chatHistory) {
@@ -86,7 +86,7 @@ async function getGeminiResponse(sessionId, userText, avatarId, language = 'en')
     const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
     // Construct the system instruction using the new avatar fields
-    let systemInstruction = `You are an AI assistant named ${avatarPersonality.name || 'AI Assistant'}.`;
+    let systemInstruction = `You are an Avatar named ${avatarPersonality.name || 'AI Assistant'}.`;
 
     if (avatarPersonality.persona_role) {
         systemInstruction += ` Your role is: ${avatarPersonality.persona_role}.`;
@@ -95,7 +95,7 @@ async function getGeminiResponse(sessionId, userText, avatarId, language = 'en')
         systemInstruction += ` Your core personality and instructions are: "${avatarPersonality.system_prompt}".`;
     }
     if (avatarPersonality.conversational_context) {
-        systemInstruction += ` Keep the following context in mind for the conversation: "${avatarPersonality.conversational_context}".`;
+        systemInstruction += ` Keep the following context in mind for the conversation and donot give comprehensive responsive just keep them short and to the point: "${avatarPersonality.conversational_context}".`;
     }
 
     // Language instruction
@@ -133,7 +133,7 @@ async function getGeminiResponse(sessionId, userText, avatarId, language = 'en')
     }
 }
 
-async function saveChatHistory(userId, avatarId, sessionId) {
+export async function saveChatHistory(userId, avatarId, sessionId) { // Changed to named export
     const history = chatSessions.get(sessionId);
     if (history && history.length > 0) {
         try {
@@ -176,5 +176,3 @@ function getLanguageName(code) {
     };
     return languages[code] || code;
 }
-
-module.exports = { getGeminiResponse, saveChatHistory, getAvatarPersonalityFromDB };

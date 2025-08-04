@@ -2,9 +2,11 @@
   "name": "avatar-backend",
   "version": "0.0.0",
   "private": true,
+  "main": "server.js",
+  "type": "module",
   "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js"
+    "start": "node bootstrap.cjs",
+    "dev": "nodemon bootstrap.cjs"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
@@ -12,7 +14,7 @@
     "cookie-parser": "~1.4.4",
     "cors": "^2.8.5",
     "debug": "~2.6.9",
-    "dotenv": "^17.2.0",
+    "dotenv": "^17.2.1",
     "express": "~4.16.1",
     "morgan": "~1.9.1",
     "node-fetch": "^3.3.2",

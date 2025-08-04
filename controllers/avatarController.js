@@ -1,8 +1,7 @@
-// avatar-backend/controllers/avatarController.js
-const { supabaseAdmin, supabase } = require('../services/supabase'); // Import both Supabase clients
+import { supabaseAdmin, supabase } from '../services/supabase.js'; // Added .js extension
 
 // Middleware for JWT Authentication (No changes needed)
-const authenticateJWT = async (req, res, next) => {
+export const authenticateJWT = async (req, res, next) => { // Changed to named export
     const authHeader = req.headers.authorization;
 
     if (!authHeader) {
@@ -33,8 +32,8 @@ const authenticateJWT = async (req, res, next) => {
     }
 };
 
-// Get user's private avatars and all public avatars (No changes needed)
-const getAvatars = async (req, res) => {
+// Get user's private avatars and all public avatars
+export const getAvatars = async (req, res) => { // Changed to named export
     try {
         const userId = req.user.id;
 
@@ -55,15 +54,16 @@ const getAvatars = async (req, res) => {
     }
 };
 
-// Create an avatar (No changes needed)
-const createAvatar = async (req, res) => {
+// Create an avatar
+export const createAvatar = async (req, res) => { // Changed to named export
     try {
         const userId = req.user.id;
-        const { name, imageUrl, voiceUrl, videoUrl, is_public = false, personalityData } = req.body;
+        // Updated to use new fields: system_prompt, persona_role, conversational_context
+        const { name, image_url, voice_url, video_url, is_public = false, system_prompt, persona_role, conversational_context } = req.body;
 
         // Basic validation for required fields
-        if (!name || !imageUrl || !voiceUrl || !personalityData) {
-            return res.status(400).json({ message: 'Missing required avatar fields: name, imageUrl, voiceUrl, personalityData' });
+        if (!name || !image_url || !voice_url || !system_prompt) {
+            return res.status(400).json({ message: 'Missing required avatar fields: name, image_url, voice_url, system_prompt' });
         }
 
         const { data, error } = await supabaseAdmin // Use supabaseAdmin for creating avatars
@@ -71,11 +71,13 @@ const createAvatar = async (req, res) => {
             .insert({
                 user_id: userId,
                 name,
-                image_url: imageUrl,
-                voice_url: voiceUrl,
-                video_url: videoUrl,
+                image_url,
+                voice_url,
+                video_url,
                 is_public,
-                personality_data: personalityData
+                system_prompt, // New field
+                persona_role, // New field
+                conversational_context // New field
             })
             .select();
 
@@ -92,21 +94,24 @@ const createAvatar = async (req, res) => {
     }
 };
 
-// --- NEW: Update an Avatar ---
-const updateAvatar = async (req, res) => {
+// Update an Avatar
+export const updateAvatar = async (req, res) => { // Changed to named export
     try {
         const userId = req.user.id; // Authenticated user's ID
         const avatarId = req.params.id; // Avatar ID from URL parameter
-        const { name, imageUrl, voiceUrl, videoUrl, is_public, personalityData } = req.body; // Fields to update
+        // Updated to use new fields: system_prompt, persona_role, conversational_context
+        const { name, image_url, voice_url, video_url, is_public, system_prompt, persona_role, conversational_context } = req.body; // Fields to update
 
         // Construct update object with only provided fields to avoid updating undefined values
         const updateData = {};
         if (name !== undefined) updateData.name = name;
-        if (imageUrl !== undefined) updateData.image_url = imageUrl;
-        if (voiceUrl !== undefined) updateData.voice_url = voiceUrl;
-        if (videoUrl !== undefined) updateData.video_url = videoUrl;
+        if (image_url !== undefined) updateData.image_url = image_url;
+        if (voice_url !== undefined) updateData.voice_url = voice_url;
+        if (video_url !== undefined) updateData.video_url = video_url;
         if (is_public !== undefined) updateData.is_public = is_public;
-        if (personalityData !== undefined) updateData.personality_data = personalityData;
+        if (system_prompt !== undefined) updateData.system_prompt = system_prompt; // New field
+        if (persona_role !== undefined) updateData.persona_role = persona_role;     // New field
+        if (conversational_context !== undefined) updateData.conversational_context = conversational_context; // New field
 
         // Ensure at least one field is being updated
         if (Object.keys(updateData).length === 0) {
@@ -140,8 +145,8 @@ const updateAvatar = async (req, res) => {
     }
 };
 
-// --- NEW: Delete an Avatar ---
-const deleteAvatar = async (req, res) => {
+// Delete an Avatar
+export const deleteAvatar = async (req, res) => { // Changed to named export
     try {
         const userId = req.user.id; // Authenticated user's ID
         const avatarId = req.params.id; // Avatar ID from URL parameter
@@ -228,12 +233,4 @@ const deleteAvatar = async (req, res) => {
         console.error('Server error deleting avatar:', err);
         res.status(500).json({ message: 'Internal server error during avatar deletion', error: err.message });
     }
-};
-
-module.exports = {
-    authenticateJWT,
-    getAvatars,
-    createAvatar,
-    updateAvatar,  // Export the new update function
-    deleteAvatar   // Export the new delete function
 };

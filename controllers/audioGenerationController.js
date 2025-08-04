@@ -1,8 +1,7 @@
-const { supabaseAdmin } = require('../services/supabase');
-const fetch = require('node-fetch').default; // IMPORTANT: .default to correctly import fetch
-const crypto = require('crypto'); // For generating secure tokens
+import { supabaseAdmin } from '../services/supabase.js';
+import fetch from 'node-fetch'; 
+import crypto from 'crypto';
 
-// In-memory cache for voice URLs to avoid repeated DB lookups
 const voiceUrlCache = new Map();
 
 // Helper to get voice URL from DB (with caching)
@@ -58,7 +57,7 @@ const validateTextForLanguage = (text, language) => {
  * @param {object} req Express request object.
  * @param {object} res Express response object.
  */
-const generateAudio = async (req, res) => {
+export const generateAudio = async (req, res) => { // Changed to named export
     const { voiceId, text, language = 'en' } = req.body; // Default language to 'en'
 
     if (!voiceId || !text || !text.trim()) {
@@ -188,7 +187,5 @@ const generateAudio = async (req, res) => {
     }
 };
 
-module.exports = {
-    generateAudio,
-    getVoiceUrlFromDB // Export if needed for other services
-};
+// If getVoiceUrlFromDB is needed elsewhere, you can export it.
+// export { getVoiceUrlFromDB };

@@ -1,8 +1,8 @@
 // avatar-backend/ws/handler.js
-const WebSocket = require('ws');
-const { getGeminiResponse, saveChatHistory } = require('../services/gemini');
-const { supabaseAdmin } = require('../services/supabase'); // Use supabaseAdmin for avatar data fetch
-const crypto = require('crypto');
+import WebSocket from 'ws';
+import { getGeminiResponse, saveChatHistory } from '../services/gemini.js';
+import { supabaseAdmin } from '../services/supabase.js'; // Use supabaseAdmin for avatar data fetch
+import crypto from 'crypto';
 
 async function handleRealtimeVoiceChat(ws, req) {
     let userId;
@@ -195,4 +195,4 @@ async function handleRealtimeVoiceChat(ws, req) {
     });
 }
 
-module.exports = { handleRealtimeVoiceChat };
+export default handleRealtimeVoiceChat ;

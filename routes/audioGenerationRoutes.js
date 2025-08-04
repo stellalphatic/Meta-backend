@@ -1,10 +1,10 @@
-const express = require('express');
-const { authenticateJWT } = require('../controllers/avatarController'); // Assuming authenticateJWT is in avatarController
-const { generateAudio } = require('../controllers/audioGenerationController');
+import express from 'express';
+import { authenticateJWT } from '../controllers/avatarController.js';
+import { generateAudio } from '../controllers/audioGenerationController.js';
 
 const router = express.Router();
 
-// Route for generating audio from text using a selected voice
 router.post('/generate', authenticateJWT, generateAudio);
 
-module.exports = router;
+export default router; 
+
