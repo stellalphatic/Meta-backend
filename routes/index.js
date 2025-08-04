@@ -1,11 +1,12 @@
-// avatar-backend/routes/index.js
 const express = require('express');
 const avatarRoutes = require('./avatarRoutes');
-const stripeRoutes = require('./stripeRoutes');
+const audioGenerationRoutes = require('./audioGenerationRoutes'); 
+const twoCheckoutRoutes = require('./twoCheckoutRoutes'); 
 
 const router = express.Router();
 
 router.use('/avatars', avatarRoutes);
-router.use('/stripe', stripeRoutes); // Prefix for Stripe related routes
+router.use('/audio', audioGenerationRoutes); 
+router.use('/2checkout', twoCheckoutRoutes); 
 
 module.exports = router;

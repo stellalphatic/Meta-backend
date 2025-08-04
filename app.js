@@ -5,8 +5,8 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
 
-const mainRouter = require('./routes/index'); // Import your main router
-const { handleTextChat } = require('./ws/chatHandler');
+const mainRouter = require('./routes/index'); 
+const { handleTextChat } = require('./ws/chatHandler'); 
 const { handleVoiceChat } = require('./ws/voiceChatHandler');
 
 const app = express();
@@ -14,7 +14,8 @@ const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json()); // For parsing application/json
+app.use(express.urlencoded({ extended: true })); // For parsing application/x-www-form-urlencoded (common for webhooks)
 
 // Routes
 app.use('/api', mainRouter); // Use the main router to include all your API routes
@@ -43,7 +44,7 @@ server.on('upgrade', function upgrade(request, socket, head) {
         wss.handleUpgrade(request, socket, head, function done(ws) {
             wss.emit('connection', ws, request, pathname);
         });
-        console.log('Video call WebSocket path received, but not fully implemented.');
+        console.log('Video call WebSocket path received. Not fully implemented; closing socket.');
         socket.destroy(); // Close for now as not fully implemented
     } else {
         console.warn(`Unknown WebSocket path: ${pathname}. Destroying socket.`);
@@ -64,9 +65,10 @@ wss.on('connection', function connection(ws, req, pathname) {
     }
 });
 
-// Start the server
+
 server.listen(port, () => {
     console.log(`Backend server running on port ${port}`);
     console.log(`WebSocket server running on ws://localhost:${port}/chat`);
     console.log(`WebSocket server running on ws://localhost:${port}/voice-chat`);
 });
+

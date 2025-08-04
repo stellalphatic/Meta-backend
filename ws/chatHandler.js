@@ -5,14 +5,18 @@ const crypto = require('crypto');
 async function handleTextChat(ws, req) {
     let userId;
     let avatarId;
-    let avatarPersonalityData;
+    // Removed avatarPersonalityData as it's now fetched by getGeminiResponse using avatarId
     let sessionId;
+    let language = 'en'; // Default language for text chat, can be passed if needed
 
     const DEFAULT_LLM_RESPONSE = "I didn't quite catch that. Could you please repeat?";
 
     const urlParams = new URLSearchParams(req.url.split('?')[1]);
     avatarId = urlParams.get('avatarId');
     const token = urlParams.get('token');
+    // If you want to pass language for text chat, you'd get it here:
+    // language = urlParams.get('language') || 'en';
+
 
     if (!avatarId || !token) {
         console.error("Missing avatarId or token in WebSocket URL for text chat.");
@@ -34,21 +38,21 @@ async function handleTextChat(ws, req) {
 
         console.log(`Text chat initiated for user: ${userId}, session: ${sessionId}, avatar: ${avatarId}`);
 
-        const { data: avatarData, error: avatarError } = await supabaseAdmin
+        // Fetch just the avatar name to send a friendly ready message
+        const { data: avatarNameData, error: avatarNameError } = await supabaseAdmin
             .from('avatars')
-            .select('personality_data, name') // Only need personality_data for text chat
+            .select('name')
             .eq('id', avatarId)
             .single();
 
-        if (avatarError || !avatarData) {
+        if (avatarNameError || !avatarNameData) {
             await ws.send(JSON.stringify({ type: 'error', message: 'Avatar not found or error loading data.' }));
-            console.error("Error loading avatar data for text chat:", avatarError);
+            console.error("Error loading avatar name for text chat:", avatarNameError);
             ws.close();
             return;
         }
-
-        avatarPersonalityData = avatarData.personality_data;
-        await ws.send(JSON.stringify({ type: 'ready', message: `Text chat with ${avatarData.name} ready!` }));
+        
+        await ws.send(JSON.stringify({ type: 'ready', message: `Text chat with ${avatarNameData.name} ready!` }));
 
     } catch (error) {
         console.error('Text chat WebSocket handler initialization error:', error);
@@ -65,10 +69,12 @@ async function handleTextChat(ws, req) {
                 const userText = parsedMessage.message; // Frontend sends 'message' key
                 console.log(`User says (text chat): "${userText}"`);
 
+                let llmResponseText;
                 if (!userText || userText.trim().length < 2) {
                     llmResponseText = DEFAULT_LLM_RESPONSE;
                 } else {
-                    llmResponseText = await getGeminiResponse(sessionId, userText, avatarPersonalityData);
+                    // Pass avatarId and language to getGeminiResponse
+                    llmResponseText = await getGeminiResponse(sessionId, userText, avatarId, language);
                 }
 
                 console.log(`LLM replies (text chat): "${llmResponseText}"`);

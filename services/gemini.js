@@ -1,4 +1,3 @@
-// services/gemini.js
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { supabaseAdmin } = require('./supabase'); // Assuming supabaseAdmin is configured for direct DB access
 
@@ -12,13 +11,67 @@ const genAI = new GoogleGenerativeAI(API_KEY);
 // In-memory store for chat sessions. In a production environment, use a persistent store like Redis or Firestore.
 const chatSessions = new Map();
 
-async function getGeminiResponse(sessionId, userText, avatarPersonalityData, language = 'en') {
+// In-memory cache for avatar personality data.
+// Key: avatarId, Value: { system_prompt, persona_role, conversational_context }
+const avatarPersonalityCache = new Map();
+
+/**
+ * Fetches avatar personality data from Supabase and caches it.
+ * @param {string} avatarId The ID of the avatar.
+ * @returns {Promise<object|null>} The avatar's personality data or null if not found/error.
+ */
+async function getAvatarPersonalityFromDB(avatarId) {
+    if (avatarPersonalityCache.has(avatarId)) {
+        console.log(`[CACHE] Avatar personality data for ${avatarId} found in cache.`);
+        return avatarPersonalityCache.get(avatarId);
+    }
+
+    console.log(`[DB] Fetching avatar personality data for ${avatarId} from database.`);
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('avatars')
+            .select('system_prompt, persona_role, conversational_context')
+            .eq('id', avatarId)
+            .single();
+
+        if (error) {
+            console.error(`[DB] Error fetching avatar personality for ${avatarId}:`, error);
+            return null;
+        }
+        if (data) {
+            avatarPersonalityCache.set(avatarId, data);
+            return data;
+        }
+        return null;
+    } catch (err) {
+        console.error(`[DB] Unexpected error fetching avatar personality for ${avatarId}:`, err);
+        return null;
+    }
+}
+
+
+/**
+ * Gets a Gemini response based on user text and avatar personality.
+ * @param {string} sessionId Unique session ID for chat history.
+ * @param {string} userText The user's input text.
+ * @param {string} avatarId The ID of the avatar for personality context.
+ * @param {string} language The desired response language (e.g., 'en', 'hi').
+ * @returns {Promise<string>} The generated Gemini text response.
+ */
+async function getGeminiResponse(sessionId, userText, avatarId, language = 'en') {
     let chatHistory = chatSessions.get(sessionId);
 
     if (!chatHistory) {
         console.log(`[GEMINI] Initializing new chat session for ${sessionId}.`);
         chatHistory = [];
         chatSessions.set(sessionId, chatHistory);
+    }
+
+    // Fetch avatar personality data using the cache
+    const avatarPersonality = await getAvatarPersonalityFromDB(avatarId);
+    if (!avatarPersonality) {
+        console.error(`[GEMINI] Could not retrieve avatar personality data for avatar ID: ${avatarId}.`);
+        return "I'm sorry, I can't access my personality right now. Could you please try again later?";
     }
 
     console.log('[GEMINI] Pushing user text to history.');
@@ -32,10 +85,20 @@ async function getGeminiResponse(sessionId, userText, avatarPersonalityData, lan
 
     const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
-    // Construct the system instruction based on avatar personality and desired language
-    let systemInstruction = `You are an AI assistant embodying the following personality: ${avatarPersonalityData}.`;
-    
-    // NEW: More specific language instruction based on user's preference for Hindi
+    // Construct the system instruction using the new avatar fields
+    let systemInstruction = `You are an AI assistant named ${avatarPersonality.name || 'AI Assistant'}.`;
+
+    if (avatarPersonality.persona_role) {
+        systemInstruction += ` Your role is: ${avatarPersonality.persona_role}.`;
+    }
+    if (avatarPersonality.system_prompt) {
+        systemInstruction += ` Your core personality and instructions are: "${avatarPersonality.system_prompt}".`;
+    }
+    if (avatarPersonality.conversational_context) {
+        systemInstruction += ` Keep the following context in mind for the conversation: "${avatarPersonality.conversational_context}".`;
+    }
+
+    // Language instruction
     if (language === 'hi') {
         systemInstruction += ` Respond in Hindi, but use a natural, conversational, and slightly informal tone. Avoid overly formal or Sanskritized Hindi. You can use common Hinglish terms if appropriate for the conversation, but primarily stick to Hindi.`;
     } else if (language && language !== 'en') {
@@ -46,11 +109,11 @@ async function getGeminiResponse(sessionId, userText, avatarPersonalityData, lan
     systemInstruction += ` Keep responses concise and natural for a voice conversation.`;
 
 
-    console.log('[GEMINI] Sending message to Gemini API... with system instruction:', systemInstruction); // Log the instruction
+    console.log('[GEMINI] Sending message to Gemini API... with system instruction:', systemInstruction);
     try {
         const result = await model.generateContent({
             contents: chatHistory,
-            systemInstruction: { parts: [{ text: systemInstruction }] }, // Use systemInstruction
+            systemInstruction: { parts: [{ text: systemInstruction }] },
         });
 
         const response = result.response;
@@ -114,5 +177,4 @@ function getLanguageName(code) {
     return languages[code] || code;
 }
 
-
-module.exports = { getGeminiResponse, saveChatHistory };
+module.exports = { getGeminiResponse, saveChatHistory, getAvatarPersonalityFromDB };

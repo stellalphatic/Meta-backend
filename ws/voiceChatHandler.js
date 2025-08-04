@@ -1,7 +1,5 @@
-// avatar-backend/ws/voiceChatHandler.js (Multilingual Support)
-
 const WebSocket = require('ws');
-const { getGeminiResponse, saveChatHistory } = require('../services/gemini');
+const { getGeminiResponse, saveChatHistory, getAvatarPersonalityFromDB } = require('../services/gemini'); // Import getAvatarPersonalityFromDB
 const { supabaseAdmin } = require('../services/supabase');
 const crypto = require('crypto');
 
@@ -33,20 +31,19 @@ function parseIncomingMessage(message) {
 async function handleVoiceChat(ws, req) {
     let userId;
     let avatarId;
-    let avatarPersonalityData;
+    let avatarDetails; // Will store system_prompt, persona_role, conversational_context, name
     let voiceServiceWs = null;
     let isSpeaking = false;
     let sessionId;
-    let avatarName;
-    let language = 'en'; // NEW: Default language
+    let language = 'en'; // Default language
 
     const DEFAULT_LLM_RESPONSE = "I'm having a little trouble with my connection. Could you please repeat that?";
 
     const urlParams = new URLSearchParams(req.url.split('?')[1]);
     avatarId = urlParams.get('avatarId');
     const token = urlParams.get('token'); // Supabase JWT token
-    let voiceCloneUrl = urlParams.get('voiceUrl');
-    language = urlParams.get('language') || 'en'; // NEW: Get language from URL, default to 'en'
+    let voiceCloneUrl = urlParams.get('voiceUrl'); // Voice URL from frontend, if provided
+    language = urlParams.get('language') || 'en'; // Get language from URL, default to 'en'
 
     if (!avatarId || !token) {
         console.error("Missing avatarId or token in WebSocket URL for voice chat.");
@@ -66,29 +63,22 @@ async function handleVoiceChat(ws, req) {
         userId = user.id;
         sessionId = crypto.randomUUID();
 
-        console.log(`Real-time voice chat initiated for user: ${userId}, session: ${sessionId}, avatar: ${avatarId}, language: ${language}`); // NEW: Log language
+        console.log(`Real-time voice chat initiated for user: ${userId}, session: ${sessionId}, avatar: ${avatarId}, language: ${language}`);
 
-        // Fetch avatar data to get personality_data and name, regardless of voiceUrl source
-        const { data: avatarDataFromDB, error: avatarError } = await supabaseAdmin
-            .from('avatars')
-            .select('personality_data, name, voice_url')
-            .eq('id', avatarId)
-            .single();
+        // Fetch avatar data including new fields and cache it
+        avatarDetails = await getAvatarPersonalityFromDB(avatarId);
 
-        if (avatarError || !avatarDataFromDB) {
-            console.error("Error loading avatar data for voice chat:", avatarError);
+        if (!avatarDetails) {
+            console.error("Error loading avatar data for voice chat or avatar not found.");
             await ws.send(JSON.stringify({ type: 'error', message: 'Avatar not found or error loading data.' }));
             ws.close();
             return;
         }
-        
-        avatarPersonalityData = avatarDataFromDB.personality_data;
-        avatarName = avatarDataFromDB.name;
-        
+
         // If voiceCloneUrl was NOT provided in the URL, use the one from Supabase
         if (!voiceCloneUrl) {
             console.warn('voiceUrl not found in WebSocket URL. Using voice_url from Supabase.');
-            voiceCloneUrl = avatarDataFromDB.voice_url;
+            voiceCloneUrl = avatarDetails.voice_url; // Assuming voice_url is part of avatarDetails now
         }
 
         if (!voiceCloneUrl) {
@@ -128,7 +118,7 @@ async function handleVoiceChat(ws, req) {
                 userId: userId,
                 avatarId: avatarId,
                 voice_clone_url: voiceCloneUrl,
-                language: language, // NEW: Pass language to Python service
+                language: language, // Pass language to Python service
             }));
         };
 
@@ -138,7 +128,7 @@ async function handleVoiceChat(ws, req) {
             if (pythonMessage) {
                 if (pythonMessage.type === 'ready') {
                     console.log('Python TTS is ready. Sending ready signal to frontend...');
-                    await ws.send(JSON.stringify({ type: 'ready', message: `Voice chat with ${avatarName} ready!` }));
+                    await ws.send(JSON.stringify({ type: 'ready', message: `Voice chat with ${avatarDetails.name} ready!` }));
                 } else if (pythonMessage.type === 'error') {
                     await ws.send(JSON.stringify({ type: 'error', message: `Voice service error: ${pythonMessage.message}` }));
                 } else if (pythonMessage.type === 'speech_start') {
@@ -197,12 +187,13 @@ async function handleVoiceChat(ws, req) {
                     return;
                 }
 
-                // Call Gemini for LLM response, passing the selected language
+                // Call Gemini for LLM response, passing the selected language and avatar ID
                 let llmResponseText;
                 if (!userText || userText.trim().length < 2) {
                     llmResponseText = DEFAULT_LLM_RESPONSE;
                 } else {
-                    llmResponseText = await getGeminiResponse(sessionId, userText, avatarPersonalityData, language); // NEW: Pass language
+                    // Pass avatarId to getGeminiResponse so it can use cached personality data
+                    llmResponseText = await getGeminiResponse(sessionId, userText, avatarId, language);
                 }
 
                 console.log(`[VOICE_CHAT] LLM replies: "${llmResponseText}"`);
