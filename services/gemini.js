@@ -1,66 +1,118 @@
-// avatar-backend/services/gemini.js
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { supabaseAdmin } = require('./supabase'); // Use supabaseAdmin for database writes
+// services/gemini.js
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { supabaseAdmin } = require('./supabase'); // Assuming supabaseAdmin is configured for direct DB access
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+// Access your API key as an environment variable (ensure it's set in your .env or Cloud Run config)
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL_NAME = "gemini-2.0-flash"; // Or "gemini-1.5-flash-latest" for newer models if available and configured
+const MAX_HISTORY_LENGTH = 10; // Keep last 10 messages for context
 
-const activeConversations = {};
+const genAI = new GoogleGenerativeAI(API_KEY);
 
-async function getGeminiResponse(sessionId, userText, avatarPersonality) {
-    if (!activeConversations[sessionId]) {
-        activeConversations[sessionId] = {
-            avatarPersonality: avatarPersonality,
-            history: [
-                { role: "user", parts: [{ text: `You are an AI avatar with the following personality and data : "${avatarPersonality}". You are designed to engage in real-time voice conversations. Respond concisely and naturally, always staying in character. Do not mention that you are an AI or a model. Start by acknowledging the user's input. And strictly donot overexplain any thing. Ask counter questions to user just like normal humans do..` }] },
-                { role: "model", parts: [{ text: "Understood! I'm ready to chat." }] }
-            ],
-            startedAt: new Date()
-        };
+// In-memory store for chat sessions. In a production environment, use a persistent store like Redis or Firestore.
+const chatSessions = new Map();
+
+async function getGeminiResponse(sessionId, userText, avatarPersonalityData, language = 'en') {
+    let chatHistory = chatSessions.get(sessionId);
+
+    if (!chatHistory) {
+        console.log(`[GEMINI] Initializing new chat session for ${sessionId}.`);
+        chatHistory = [];
+        chatSessions.set(sessionId, chatHistory);
     }
 
-    const chat = model.startChat({
-        history: activeConversations[sessionId].history,
-        generationConfig: {
-            maxOutputTokens: 200,
-        },
-    });
+    console.log('[GEMINI] Pushing user text to history.');
+    chatHistory.push({ role: "user", parts: [{ text: userText }] });
 
-    const result = await chat.sendMessage(userText);
-    const response = await result.response;
-    const text = response.text();
+    // Keep chat history within limits
+    if (chatHistory.length > MAX_HISTORY_LENGTH) {
+        // Remove older messages, keeping the most recent ones for context
+        chatHistory = chatHistory.slice(chatHistory.length - MAX_HISTORY_LENGTH);
+    }
 
-    activeConversations[sessionId].history.push({ role: "user", parts: [{ text: userText }] });
-    activeConversations[sessionId].history.push({ role: "model", parts: [{ text: text }] });
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
-    return text;
+    // Construct the system instruction based on avatar personality and desired language
+    let systemInstruction = `You are an AI assistant embodying the following personality: ${avatarPersonalityData}.`;
+    
+    // NEW: More specific language instruction based on user's preference for Hindi
+    if (language === 'hi') {
+        systemInstruction += ` Respond in Hindi, but use a natural, conversational, and slightly informal tone. Avoid overly formal or Sanskritized Hindi. You can use common Hinglish terms if appropriate for the conversation, but primarily stick to Hindi.`;
+    } else if (language && language !== 'en') {
+        systemInstruction += ` Respond only in ${getLanguageName(language)}.`;
+    } else {
+        systemInstruction += ` Respond in English.`;
+    }
+    systemInstruction += ` Keep responses concise and natural for a voice conversation.`;
+
+
+    console.log('[GEMINI] Sending message to Gemini API... with system instruction:', systemInstruction); // Log the instruction
+    try {
+        const result = await model.generateContent({
+            contents: chatHistory,
+            systemInstruction: { parts: [{ text: systemInstruction }] }, // Use systemInstruction
+        });
+
+        const response = result.response;
+        const geminiText = response.text();
+        console.log('[GEMINI] Received result from Gemini API.');
+        console.log(`[GEMINI] Gemini response for session ${sessionId}: ${geminiText}`);
+
+        // Add Gemini's response to history
+        chatHistory.push({ role: "model", parts: [{ text: geminiText }] });
+
+        return geminiText;
+
+    } catch (error) {
+        console.error('[GEMINI] Error calling Gemini API:', error);
+        // Provide a fallback response
+        return "I'm sorry, I'm having trouble connecting right now. Could you please try again in a moment?";
+    }
 }
 
 async function saveChatHistory(userId, avatarId, sessionId) {
-    const conversation = activeConversations[sessionId];
-    if (conversation && conversation.history.length > 2) { // Ensure actual conversation happened beyond initial setup
+    const history = chatSessions.get(sessionId);
+    if (history && history.length > 0) {
         try {
             const { data, error } = await supabaseAdmin
-                .from('chat_history')
-                .insert({
-                    user_id: userId,
-                    avatar_id: avatarId,
-                    session_id: sessionId,
-                    chat_messages: conversation.history,
-                    started_at: conversation.startedAt.toISOString(),
-                    ended_at: new Date().toISOString()
-                });
+                .from('chat_histories')
+                .insert([
+                    {
+                        user_id: userId,
+                        avatar_id: avatarId,
+                        session_id: sessionId,
+                        history: history,
+                        timestamp: new Date().toISOString()
+                    }
+                ]);
 
             if (error) throw error;
-            console.log(`Chat history saved for session ${sessionId}:`, data);
-            delete activeConversations[sessionId]; // Clean up memory
-        } catch (e) {
-            console.error("Error saving chat history to Supabase:", e);
+            console.log(`[DB] Chat history saved for session ${sessionId}.`);
+            chatSessions.delete(sessionId); // Clear from memory after saving
+        } catch (error) {
+            console.error(`[DB] Error saving chat history for session ${sessionId}:`, error);
         }
-    } else if (conversation) {
-        console.log(`Session ${sessionId} closed with no meaningful chat history to save.`);
-        delete activeConversations[sessionId]; // Still clean up if no actual chat
     }
 }
+
+// Helper to get full language name for prompt
+function getLanguageName(code) {
+    const languages = {
+        'en': 'English',
+        'hi': 'Hindi',
+        'es': 'Spanish',
+        'fr': 'French',
+        'de': 'German',
+        'it': 'Italian',
+        'ja': 'Japanese',
+        'ko': 'Korean',
+        'pt': 'Portuguese',
+        'ru': 'Russian',
+        'zh-cn': 'Chinese (Simplified)',
+        // Add more as needed
+    };
+    return languages[code] || code;
+}
+
 
 module.exports = { getGeminiResponse, saveChatHistory };
