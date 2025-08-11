@@ -1,10 +1,17 @@
-import express from 'express';
-import { authenticateJWT } from '../controllers/avatarController.js';
-import { generateAudio } from '../controllers/audioGenerationController.js';
+import express from "express"
+import { authenticateJWT } from "../middleware/authMiddleware.js"
+import { checkAudioLimit } from "../middleware/usageLimitMiddleware.js"
+import { generateAudio, getAudioHistory, deleteAudio } from "../controllers/audioGenerationController.js"
 
-const router = express.Router();
+const router = express.Router()
 
-router.post('/generate', authenticateJWT, generateAudio);
+// Generate audio (requires auth and usage check)
+router.post("/generate", authenticateJWT, checkAudioLimit, generateAudio)
 
-export default router; 
+// Get user's audio history (requires auth)
+router.get("/history", authenticateJWT, getAudioHistory)
 
+// Delete an audio (requires auth)
+router.delete("/:audioId", authenticateJWT, deleteAudio)
+
+export default router

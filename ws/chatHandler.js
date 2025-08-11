@@ -26,6 +26,8 @@ async function handleTextChat(ws, req) {
     }
 
     try {
+        // TODO make auth middleware simplify the code
+        // picture cacheing
         const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
         if (authError || !user) {
             console.error('WebSocket authentication failed for text chat:', authError?.message || 'Invalid token');
@@ -62,6 +64,7 @@ async function handleTextChat(ws, req) {
     }
 
     ws.on('message', async message => {
+        let llmResponseText;
         try {
             const parsedMessage = JSON.parse(message.toString());
 
@@ -69,7 +72,7 @@ async function handleTextChat(ws, req) {
                 const userText = parsedMessage.message; // Frontend sends 'message' key
                 console.log(`User says (text chat): "${userText}"`);
 
-                let llmResponseText;
+                // look for maliciuos prompts
                 if (!userText || userText.trim().length < 2) {
                     llmResponseText = DEFAULT_LLM_RESPONSE;
                 } else {

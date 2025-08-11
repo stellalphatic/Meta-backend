@@ -1,191 +1,419 @@
-import { supabaseAdmin } from '../services/supabase.js';
-import fetch from 'node-fetch'; 
-import crypto from 'crypto';
-
-const voiceUrlCache = new Map();
-
-// Helper to get voice URL from DB (with caching)
-async function getVoiceUrlFromDB(voiceId) {
-    if (voiceUrlCache.has(voiceId)) {
-        console.log(`[CACHE] Voice URL for ${voiceId} found in cache.`);
-        return voiceUrlCache.get(voiceId);
-    }
-
-    console.log(`[DB] Fetching voice URL for ${voiceId} from database.`);
-    try {
-        const { data, error } = await supabaseAdmin
-            .from('voices')
-            .select('audio_url')
-            .eq('id', voiceId)
-            .single();
-
-        if (error) {
-            console.error(`[DB] Error fetching voice URL for ${voiceId}:`, error);
-            return null;
-        }
-        if (data) {
-            voiceUrlCache.set(voiceId, data.audio_url);
-            return data.audio_url;
-        }
-        return null;
-    } catch (err) {
-        console.error(`[DB] Unexpected error fetching voice URL for ${voiceId}:`, err);
-        return null;
-    }
-}
-
-// Supported languages for validation
-const SUPPORTED_LANGUAGES = ['en', 'hi', 'es', 'fr', 'de', 'it', 'ja', 'ko', 'pt', 'ru']; // Add/remove as per Coqui XTTS support
-
-// Function to validate text based on language (simple regex for now)
-const validateTextForLanguage = (text, language) => {
-    // This is a very basic validation. For robust validation, you'd need a more sophisticated NLP library.
-    // For Hindi, check for Devanagari script characters.
-    if (language === 'hi') {
-        const hindiRegex = /[\u0900-\u097F\s.,!?;:]+/; // Devanagari script range
-        if (!hindiRegex.test(text)) {
-            return { isValid: false, message: 'Text must be in Hindi for the selected language.' };
-        }
-    }
-    // Add more language-specific validations here if needed
-    return { isValid: true };
-};
-
+import { supabaseAdmin } from "../services/supabase.js"
+import fetch from "node-fetch"
+import crypto from "crypto"
 
 /**
- * Handles requests to generate audio from text using Coqui XTTS.
- * @param {object} req Express request object.
- * @param {object} res Express response object.
+ * Generate authentication token for voice service
  */
-export const generateAudio = async (req, res) => { // Changed to named export
-    const { voiceId, text, language = 'en' } = req.body; // Default language to 'en'
+function generateVoiceServiceToken() {
+  const secretKey = process.env.VOICE_SERVICE_SECRET_KEY
+  if (!secretKey) {
+    throw new Error("VOICE_SERVICE_SECRET_KEY not configured")
+  }
 
-    if (!voiceId || !text || !text.trim()) {
-        return res.status(400).json({ message: 'Missing voiceId or text for audio generation.' });
+  const timestamp = Math.floor(Date.now() / 1000)
+  const stringToSign = `${timestamp}`
+  const signature = crypto.createHmac("sha256", secretKey).update(stringToSign).digest("hex")
+  const payload = `${signature}.${timestamp}`
+  const encodedPayload = Buffer.from(payload).toString("base64url")
+
+  return `VOICE_CLONE_AUTH-${encodedPayload}`
+}
+
+/**
+ * Generate audio using voice cloning service
+ */
+export const generateAudio = async (req, res) => {
+  const { voiceId, text, language = "en" } = req.body
+  const userId = req.user?.id
+
+  console.log(`[AUDIO_GEN] Request from user ${userId} for voice ${voiceId}`)
+
+  if (!voiceId || !text || !text.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: "Missing voiceId or text for audio generation.",
+      code: "MISSING_PARAMETERS",
+    })
+  }
+
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+      code: "AUTH_REQUIRED",
+    })
+  }
+
+  // Check if user is within audio generation limits
+  if (req.isWithinAudioLimit === false) {
+    return res.status(403).json({
+      success: false,
+      message: "You have exceeded your monthly audio generation limit.",
+      code: "USAGE_LIMIT_EXCEEDED",
+      usageInfo: req.audioUsageInfo,
+    })
+  }
+
+  let generatedAudioRecord = null
+
+  try {
+    // 1. Fetch voice details
+    const { data: voiceData, error: voiceError } = await supabaseAdmin
+      .from("voices")
+      .select("name, audio_url")
+      .eq("id", voiceId)
+      .single()
+
+    if (voiceError || !voiceData) {
+      console.error(`[AUDIO_GEN] Error fetching voice details for ${voiceId}:`, voiceError)
+      return res.status(404).json({
+        success: false,
+        message: "Voice not found or accessible.",
+        code: "VOICE_NOT_FOUND",
+      })
     }
 
-    if (!SUPPORTED_LANGUAGES.includes(language)) {
-        return res.status(400).json({ message: `Unsupported language: ${language}. Supported languages are: ${SUPPORTED_LANGUAGES.join(', ')}` });
+    const { audio_url: voiceCloneUrl } = voiceData
+
+    if (!voiceCloneUrl) {
+      console.error(`[AUDIO_GEN] Voice ${voiceId} is missing audio URL.`)
+      return res.status(400).json({
+        success: false,
+        message: "Voice is not properly configured for audio generation.",
+        code: "VOICE_INCOMPLETE",
+      })
     }
 
-    const { isValid, message: validationMessage } = validateTextForLanguage(text, language);
-    if (!isValid) {
-        return res.status(400).json({ message: validationMessage });
-    }
-
+    // 2. Create initial record in database
     try {
-        const userId = req.user.id; // From authenticateJWT middleware
+      const { data, error: insertError } = await supabaseAdmin
+        .from("generated_audios")
+        .insert({
+          user_id: userId,
+          voice_id: voiceId,
+          text_input: text,
+          language: language,
+          audio_url: "", // Will be updated when generation completes
+          status: "generating",
+          error_message: null,
+          created_at: new Date().toISOString(),
+          timestamp: new Date().toISOString(),
+        })
+        .select()
+        .single()
 
-        // Get the voice audio URL using the caching helper
-        const voiceAudioUrl = await getVoiceUrlFromDB(voiceId);
-        if (!voiceAudioUrl) {
-            return res.status(404).json({ message: 'Selected voice not found or accessible.' });
-        }
+      if (insertError) {
+        console.error("[AUDIO_GEN] Error saving audio metadata:", insertError)
+        throw new Error(`Database error: ${insertError.message}`)
+      }
 
-        // Use the base URL from environment and append the specific endpoint path
-        const coquiXttsBaseUrl = process.env.COQUI_XTTS_BASE_URL; // Renamed from COQUI_XTTS_API_URL
-        if (!coquiXttsBaseUrl) {
-            console.error("COQUI_XTTS_BASE_URL environment variable is not set.");
-            return res.status(500).json({ message: 'Server configuration error: Coqui XTTS Base URL missing.' });
-        }
-        const coquiXttsGenerateEndpoint = `${coquiXttsBaseUrl}/generate-audio`; // Construct the full URL here
-
-        // Generate the custom auth token for the Python service (reusing logic from voiceChatHandler)
-        const voiceServiceSecretKey = process.env.VOICE_SERVICE_SECRET_KEY;
-        if (!voiceServiceSecretKey) {
-            console.error("VOICE_SERVICE_SECRET_KEY environment variable is not set.");
-            return res.status(500).json({ message: 'Server configuration error: Voice service key missing.' });
-        }
-        const timestamp = Math.floor(Date.now() / 1000);
-        const stringToSign = `${timestamp}`;
-        const signature = crypto.createHmac('sha256', voiceServiceSecretKey).update(stringToSign).digest('hex');
-        const payload = `${signature}.${timestamp}`;
-        const encodedPayload = Buffer.from(payload).toString('base64url');
-        const voiceServiceAuthToken = `VOICE_CLONE_AUTH-${encodedPayload}`;
-
-
-        // Prepare payload for Coqui XTTS service
-        const coquiPayload = {
-            text: text,
-            voice_id: voiceId, // Pass voice_id for caching on Python side
-            voice_clone_url: voiceAudioUrl, // Pass the actual URL
-            language: language // Pass language to XTTS service
-        };
-
-        console.log('[AUDIO_GEN] Sending request to Coqui XTTS service:', coquiPayload);
-
-        const response = await fetch(coquiXttsGenerateEndpoint, { // Use the constructed endpoint URL
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': voiceServiceAuthToken, // Pass the custom auth token
-            },
-            body: JSON.stringify(coquiPayload),
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('[AUDIO_GEN] Coqui XTTS service error:', response.status, errorText);
-            return res.status(response.status).json({ message: `Failed to generate audio from voice service: ${errorText}` });
-        }
-
-        // The Python service will return the audio as a binary blob
-        const audioBlob = await response.blob();
-
-        // Generate a unique filename for the generated audio
-        const fileName = `generated_audios/${userId}/${voiceId}-${Date.now()}.wav`; // Or .mp3, depending on XTTS output
-
-        // Upload the generated audio to Supabase Storage
-        const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
-            .from('avatar-media') // Use the same bucket as other media
-            .upload(fileName, audioBlob, {
-                contentType: 'audio/wav', // Adjust based on actual XTTS output format
-                upsert: false,
-            });
-
-        if (uploadError) {
-            console.error('[AUDIO_GEN] Supabase Storage Error uploading generated audio:', uploadError);
-            return res.status(500).json({ message: 'Failed to store generated audio.', error: uploadError.message });
-        }
-
-        const { data: publicUrlData } = supabaseAdmin.storage
-            .from('avatar-media')
-            .getPublicUrl(fileName);
-
-        if (!publicUrlData || !publicUrlData.publicUrl) {
-            throw new Error('Failed to get public URL for generated audio.');
-        }
-
-        // Save metadata about the generated audio to the database
-        const { data: generatedAudioRecord, error: insertError } = await supabaseAdmin
-            .from('generated_audios') // New table for generated audios
-            .insert({
-                user_id: userId,
-                voice_id: voiceId,
-                text_input: text,
-                language: language,
-                audio_url: publicUrlData.publicUrl,
-            })
-            .select()
-            .single();
-
-        if (insertError) {
-            console.error('[AUDIO_GEN] Supabase Error saving generated audio metadata:', insertError);
-            // Consider deleting the uploaded file if DB insert fails
-            return res.status(500).json({ message: 'Failed to save generated audio metadata.', error: insertError.message });
-        }
-
-        res.status(200).json({
-            message: 'Audio generated and stored successfully!',
-            audioUrl: publicUrlData.publicUrl,
-            record: generatedAudioRecord,
-        });
-
-    } catch (err) {
-        console.error('[AUDIO_GEN] Server error during audio generation:', err);
-        res.status(500).json({ message: 'Internal server error during audio generation.', error: err.message });
+      generatedAudioRecord = data
+      console.log(`[AUDIO_GEN] Audio record saved with ID: ${generatedAudioRecord.id}`)
+    } catch (dbError) {
+      console.error("[AUDIO_GEN] Database operation failed:", dbError)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to save audio generation record.",
+        code: "DATABASE_ERROR",
+        error: dbError.message,
+      })
     }
-};
 
-// If getVoiceUrlFromDB is needed elsewhere, you can export it.
-// export { getVoiceUrlFromDB };
+    // 3. Generate Audio from Text
+    console.log(`[AUDIO_GEN] Generating audio from text...`)
+    const voiceServiceBaseUrl = process.env.COQUI_XTTS_BASE_URL
+
+    if (!voiceServiceBaseUrl) {
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          status: "failed",
+          error_message: "Voice service not configured",
+        })
+        .eq("id", generatedAudioRecord.id)
+
+      return res.status(500).json({
+        success: false,
+        message: "Voice service not configured.",
+        code: "SERVICE_NOT_CONFIGURED",
+      })
+    }
+
+    // Generate proper authentication token for voice service
+    const voiceServiceToken = generateVoiceServiceToken()
+    console.log(`[AUDIO_GEN] Generated voice service token: ${voiceServiceToken.substring(0, 20)}...`)
+
+    const audioResponse = await fetch(`${voiceServiceBaseUrl}/generate-audio`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: voiceServiceToken,
+      },
+      body: JSON.stringify({
+        voice_id: voiceId,
+        voice_clone_url: voiceCloneUrl,
+        text: text,
+        language: language,
+      }),
+    })
+
+    if (!audioResponse.ok) {
+      const errorText = await audioResponse.text()
+      console.error("[AUDIO_GEN] Voice service error:", audioResponse.status, errorText)
+
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          status: "failed",
+          error_message: `Voice service error: ${errorText}`,
+        })
+        .eq("id", generatedAudioRecord.id)
+
+      return res.status(audioResponse.status).json({
+        success: false,
+        message: `Failed to generate audio: ${errorText}`,
+        code: "AUDIO_GENERATION_FAILED",
+      })
+    }
+
+    console.log(`[AUDIO_GEN] Audio generation successful`)
+    const audioBlob = await audioResponse.blob()
+
+    // Upload audio to storage
+    const audioFileName = `generated_audios/${userId}/${generatedAudioRecord.id}-${Date.now()}.wav`
+    const { data: audioUploadData, error: audioUploadError } = await supabaseAdmin.storage
+      .from("avatar-media")
+      .upload(audioFileName, audioBlob, {
+        contentType: "audio/wav",
+        upsert: false,
+      })
+
+    if (audioUploadError) {
+      console.error("[AUDIO_GEN] Error uploading audio:", audioUploadError)
+
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          status: "failed",
+          error_message: "Failed to store generated audio",
+        })
+        .eq("id", generatedAudioRecord.id)
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to store generated audio.",
+        code: "AUDIO_UPLOAD_FAILED",
+      })
+    }
+
+    const { data: audioUrlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(audioFileName)
+    const audioUrl = audioUrlData.publicUrl
+    console.log(`[AUDIO_GEN] Audio uploaded to: ${audioUrl}`)
+
+    // Update database record with final URL
+    const { data: updatedRecord, error: updateError } = await supabaseAdmin
+      .from("generated_audios")
+      .update({
+        audio_url: audioUrl,
+        status: "completed",
+      })
+      .eq("id", generatedAudioRecord.id)
+      .select()
+      .single()
+
+    if (updateError) {
+      console.error("[AUDIO_GEN] Error updating record:", updateError)
+    }
+
+    // Update user's audio generation usage
+    try {
+      const { data: profile, error: fetchError } = await supabaseAdmin
+        .from("profiles")
+        .select("audio_generation_this_month")
+        .eq("id", userId)
+        .single()
+
+      if (!fetchError && profile) {
+        const currentUsage = profile.audio_generation_this_month || 0
+        const newUsage = currentUsage + 1
+
+        await supabaseAdmin
+          .from("profiles")
+          .update({
+            audio_generation_this_month: newUsage,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", userId)
+
+        console.log(`[AUDIO_GEN] Updated audio usage for user ${userId}: +1 generation (total: ${newUsage})`)
+      }
+    } catch (usageError) {
+      console.error("[AUDIO_GEN] Error updating usage:", usageError)
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Audio generated successfully!",
+      data: {
+        record: updatedRecord || generatedAudioRecord,
+        audioUrl: audioUrl,
+        usageInfo: req.audioUsageInfo,
+      },
+    })
+  } catch (err) {
+    console.error("[AUDIO_GEN] Server error:", err)
+
+    // If we have a record, mark it as failed
+    if (generatedAudioRecord) {
+      try {
+        await supabaseAdmin
+          .from("generated_audios")
+          .update({
+            status: "failed",
+            error_message: err.message,
+          })
+          .eq("id", generatedAudioRecord.id)
+      } catch (updateError) {
+        console.error("[AUDIO_GEN] Failed to update error status:", updateError)
+      }
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Internal server error during audio generation.",
+      code: "INTERNAL_ERROR",
+      error: err.message,
+    })
+  }
+}
+
+/**
+ * Get user's audio generation history
+ */
+export const getAudioHistory = async (req, res) => {
+  const userId = req.user?.id
+
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+      code: "AUTH_REQUIRED",
+    })
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("generated_audios")
+      .select(`
+        *,
+        voices (
+          name
+        )
+      `)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+
+    if (error) throw error
+
+    res.status(200).json({
+      success: true,
+      data: {
+        audios: data || [],
+        total: data?.length || 0,
+      },
+    })
+  } catch (err) {
+    console.error("[AUDIO_HISTORY] Error:", err)
+    res.status(500).json({
+      success: false,
+      message: "Error fetching audio history.",
+      code: "AUDIO_HISTORY_ERROR",
+      error: err.message,
+    })
+  }
+}
+
+/**
+ * Delete a generated audio record
+ */
+export const deleteAudio = async (req, res) => {
+  const { audioId } = req.params
+  const userId = req.user?.id
+
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+      code: "AUTH_REQUIRED",
+    })
+  }
+
+  if (!audioId) {
+    return res.status(400).json({
+      success: false,
+      message: "Audio ID is required.",
+      code: "MISSING_AUDIO_ID",
+    })
+  }
+
+  try {
+    // First, get the audio record to check ownership and get file URL
+    const { data: audio, error: fetchError } = await supabaseAdmin
+      .from("generated_audios")
+      .select("*")
+      .eq("id", audioId)
+      .eq("user_id", userId)
+      .single()
+
+    if (fetchError || !audio) {
+      return res.status(404).json({
+        success: false,
+        message: "Audio not found or you don't have permission to delete it.",
+        code: "AUDIO_NOT_FOUND",
+      })
+    }
+
+    // Delete the audio file from storage if it exists
+    if (audio.audio_url) {
+      try {
+        // Extract file path from URL
+        const urlParts = audio.audio_url.split("/avatar-media/")
+        if (urlParts.length > 1) {
+          const filePath = urlParts[1]
+          await supabaseAdmin.storage.from("avatar-media").remove([filePath])
+          console.log(`[AUDIO_DELETE] Deleted audio file: ${filePath}`)
+        }
+      } catch (storageError) {
+        console.warn("[AUDIO_DELETE] Failed to delete audio file from storage:", storageError)
+        // Continue with database deletion even if file deletion fails
+      }
+    }
+
+    // Delete the database record
+    const { error: deleteError } = await supabaseAdmin
+      .from("generated_audios")
+      .delete()
+      .eq("id", audioId)
+      .eq("user_id", userId)
+
+    if (deleteError) {
+      throw deleteError
+    }
+
+    console.log(`[AUDIO_DELETE] Successfully deleted audio ${audioId} for user ${userId}`)
+
+    res.status(200).json({
+      success: true,
+      message: "Audio deleted successfully.",
+    })
+  } catch (error) {
+    console.error("[AUDIO_DELETE] Error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error deleting audio.",
+      code: "AUDIO_DELETE_ERROR",
+      error: error.message,
+    })
+  }
+}

@@ -1,13 +1,26 @@
-// avatar-backend/routes/avatarRoutes.js
-import express from 'express';
-import { authenticateJWT, getAvatars, createAvatar, updateAvatar, deleteAvatar } from '../controllers/avatarController.js';
+import express from "express"
+import { authenticateJWT, rateLimit } from "../middleware/authMiddleware.js"
+import {
+  getUserAvatars,
+  getAvatarById,
+  createAvatar,
+  updateAvatar,
+  deleteAvatar,
+} from "../controllers/avatarController.js"
 
-const router = express.Router();
+const router = express.Router()
 
-router.get('/', authenticateJWT, getAvatars);
-router.post('/', authenticateJWT, createAvatar);
+// Apply authentication to all routes
+router.use(authenticateJWT)
 
-router.put('/:id', authenticateJWT, updateAvatar);
-router.delete('/:id', authenticateJWT, deleteAvatar);
+// Apply rate limiting
+router.use(rateLimit(50, 15 * 60 * 1000)) // 50 requests per 15 minutes
 
-export default router; 
+// Routes
+router.get("/", getUserAvatars)
+router.get("/:id", getAvatarById)
+router.post("/", createAvatar)
+router.put("/:id", updateAvatar)
+router.delete("/:id", deleteAvatar)
+
+export default router

@@ -1,236 +1,270 @@
-import { supabaseAdmin, supabase } from '../services/supabase.js'; // Added .js extension
+import { supabaseAdmin } from "../services/supabase.js"
 
-// Middleware for JWT Authentication (No changes needed)
-export const authenticateJWT = async (req, res, next) => { // Changed to named export
-    const authHeader = req.headers.authorization;
+/**
+ * Get all avatars for authenticated user
+ */
+export const getUserAvatars = async (req, res) => {
+  try {
+    const userId = req.user.id
 
-    if (!authHeader) {
-        return res.status(401).json({ message: 'Authorization header missing' });
+    const { data: avatars, error } = await supabaseAdmin
+      .from("avatars")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      console.error("Error fetching user avatars:", error)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch avatars",
+        error: error.message,
+      })
     }
 
-    const token = authHeader.split(' ')[1];
+    res.json({
+      success: true,
+      data: avatars || [],
+      count: avatars?.length || 0,
+    })
+  } catch (error) {
+    console.error("Get user avatars error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    })
+  }
+}
 
-    if (!token) {
-        return res.status(401).json({ message: 'Token missing' });
+/**
+ * Get single avatar by ID
+ */
+export const getAvatarById = async (req, res) => {
+  try {
+    const { id } = req.params
+    const userId = req.user.id
+
+    const { data: avatar, error } = await supabaseAdmin
+      .from("avatars")
+      .select("*")
+      .eq("id", id)
+      .eq("user_id", userId)
+      .single()
+
+    if (error) {
+      if (error.code === "PGRST116") {
+        return res.status(404).json({
+          success: false,
+          message: "Avatar not found",
+          code: "AVATAR_NOT_FOUND",
+        })
+      }
+      throw error
     }
 
-    try {
-        // Use the regular supabase client for auth operations
-        const { data: { user }, error } = await supabase.auth.getUser(token);
+    res.json({
+      success: true,
+      data: avatar,
+    })
+  } catch (error) {
+    console.error("Get avatar by ID error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch avatar",
+      error: error.message,
+    })
+  }
+}
 
-        if (error || !user) {
-            console.error('JWT verification error:', error?.message || 'User not found');
-            return res.status(401).json({ message: 'Invalid or expired token' });
-        }
+/**
+ * Create new avatar
+ */
+export const createAvatar = async (req, res) => {
+  try {
+    const userId = req.user.id
+    const { name, image_url, voice_url, system_prompt, persona_role, conversational_context } = req.body
 
-        req.user = user;
-        console.log(`Authenticated user ID: ${user.id}`);
-        next();
-    } catch (err) {
-        console.error('Unexpected error during JWT verification:', err);
-        return res.status(500).json({ message: 'Internal server error during authentication' });
+    // Validation
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Avatar name is required",
+        code: "NAME_REQUIRED",
+      })
     }
-};
 
-// Get user's private avatars and all public avatars
-export const getAvatars = async (req, res) => { // Changed to named export
-    try {
-        const userId = req.user.id;
-
-        const { data, error } = await supabaseAdmin // Use supabaseAdmin for fetching avatars
-            .from('avatars')
-            .select('*')
-            .or(`user_id.eq.${userId},is_public.eq.true`);
-
-        if (error) {
-            console.error('Error fetching avatars:', error);
-            return res.status(500).json({ message: 'Error fetching avatars', error: error.message });
-        }
-
-        res.json(data);
-    } catch (err) {
-        console.error('Server error fetching avatars:', err);
-        res.status(500).json({ message: 'Internal server error' });
+    if (!image_url || !image_url.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Avatar image URL is required",
+        code: "IMAGE_URL_REQUIRED",
+      })
     }
-};
 
-// Create an avatar
-export const createAvatar = async (req, res) => { // Changed to named export
-    try {
-        const userId = req.user.id;
-        // Updated to use new fields: system_prompt, persona_role, conversational_context
-        const { name, image_url, voice_url, video_url, is_public = false, system_prompt, persona_role, conversational_context } = req.body;
+    const { data: avatar, error } = await supabaseAdmin
+      .from("avatars")
+      .insert({
+        user_id: userId,
+        name: name.trim(),
+        image_url: image_url.trim(),
+        voice_url: voice_url?.trim() || null,
+        system_prompt: system_prompt?.trim() || null,
+        persona_role: persona_role?.trim() || null,
+        conversational_context: conversational_context?.trim() || null,
+      })
+      .select()
+      .single()
 
-        // Basic validation for required fields
-        if (!name || !image_url || !voice_url || !system_prompt) {
-            return res.status(400).json({ message: 'Missing required avatar fields: name, image_url, voice_url, system_prompt' });
-        }
-
-        const { data, error } = await supabaseAdmin // Use supabaseAdmin for creating avatars
-            .from('avatars')
-            .insert({
-                user_id: userId,
-                name,
-                image_url,
-                voice_url,
-                video_url,
-                is_public,
-                system_prompt, // New field
-                persona_role, // New field
-                conversational_context // New field
-            })
-            .select();
-
-        if (error) {
-            console.error('Supabase Error creating avatar:', error);
-            // Provide more detail in the error response
-            return res.status(500).json({ message: 'Error creating avatar in database', error: error.message, details: error.details, hint: error.hint });
-        }
-
-        res.status(201).json(data[0]);
-    } catch (err) {
-        console.error('Server error creating avatar (catch block):', err);
-        res.status(500).json({ message: 'Internal server error during avatar creation', error: err.message });
+    if (error) {
+      console.error("Error creating avatar:", error)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create avatar",
+        error: error.message,
+      })
     }
-};
 
-// Update an Avatar
-export const updateAvatar = async (req, res) => { // Changed to named export
-    try {
-        const userId = req.user.id; // Authenticated user's ID
-        const avatarId = req.params.id; // Avatar ID from URL parameter
-        // Updated to use new fields: system_prompt, persona_role, conversational_context
-        const { name, image_url, voice_url, video_url, is_public, system_prompt, persona_role, conversational_context } = req.body; // Fields to update
+    res.status(201).json({
+      success: true,
+      message: "Avatar created successfully",
+      data: avatar,
+    })
+  } catch (error) {
+    console.error("Create avatar error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    })
+  }
+}
 
-        // Construct update object with only provided fields to avoid updating undefined values
-        const updateData = {};
-        if (name !== undefined) updateData.name = name;
-        if (image_url !== undefined) updateData.image_url = image_url;
-        if (voice_url !== undefined) updateData.voice_url = voice_url;
-        if (video_url !== undefined) updateData.video_url = video_url;
-        if (is_public !== undefined) updateData.is_public = is_public;
-        if (system_prompt !== undefined) updateData.system_prompt = system_prompt; // New field
-        if (persona_role !== undefined) updateData.persona_role = persona_role;     // New field
-        if (conversational_context !== undefined) updateData.conversational_context = conversational_context; // New field
+/**
+ * Update avatar
+ */
+export const updateAvatar = async (req, res) => {
+  try {
+    const { id } = req.params
+    const userId = req.user.id
+    const { name, image_url, voice_url, system_prompt, persona_role, conversational_context } = req.body
 
-        // Ensure at least one field is being updated
-        if (Object.keys(updateData).length === 0) {
-            return res.status(400).json({ message: 'No valid fields provided for update.' });
-        }
+    // Check if avatar exists and belongs to user
+    const { data: existingAvatar, error: fetchError } = await supabaseAdmin
+      .from("avatars")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", userId)
+      .single()
 
-        // Update the avatar in Supabase. Crucially, we use `.eq('user_id', userId)`
-        // to ensure that the authenticated user can only update their own avatars.
-        const { data, error } = await supabaseAdmin
-            .from('avatars')
-            .update(updateData)
-            .eq('id', avatarId)
-            .eq('user_id', userId) // Security check: ensure user owns this avatar
-            .select(); // Return the updated record
-
-        if (error) {
-            console.error('Supabase Error updating avatar:', error);
-            return res.status(500).json({ message: 'Error updating avatar in database', error: error.message });
-        }
-
-        // If no data is returned, it means either the avatar ID was wrong or
-        // the authenticated user does not own that avatar.
-        if (!data || data.length === 0) {
-            return res.status(404).json({ message: 'Avatar not found or you do not have permission to update it.' });
-        }
-
-        res.status(200).json(data[0]); // Respond with the updated avatar data
-    } catch (err) {
-        console.error('Server error updating avatar:', err);
-        res.status(500).json({ message: 'Internal server error during avatar update', error: err.message });
+    if (fetchError) {
+      if (fetchError.code === "PGRST116") {
+        return res.status(404).json({
+          success: false,
+          message: "Avatar not found",
+          code: "AVATAR_NOT_FOUND",
+        })
+      }
+      throw fetchError
     }
-};
 
-// Delete an Avatar
-export const deleteAvatar = async (req, res) => { // Changed to named export
-    try {
-        const userId = req.user.id; // Authenticated user's ID
-        const avatarId = req.params.id; // Avatar ID from URL parameter
-
-        // First, fetch the avatar to get its associated file URLs.
-        // This is necessary because we need the URLs to delete files from Supabase Storage.
-        // Also perform the user_id check here for security before attempting deletion.
-        const { data: avatarToDelete, error: fetchError } = await supabaseAdmin
-            .from('avatars')
-            .select('image_url, voice_url, video_url')
-            .eq('id', avatarId)
-            .eq('user_id', userId) // Security check: ensure user owns this avatar
-            .single(); // Expecting a single record
-
-        if (fetchError || !avatarToDelete) {
-            console.error('Error fetching avatar for deletion or avatar not found/owned:', fetchError);
-            return res.status(404).json({ message: 'Avatar not found or you do not have permission to delete it.' });
-        }
-
-        // Delete the avatar record from the 'avatars' table in the database
-        const { error: deleteDbError } = await supabaseAdmin
-            .from('avatars')
-            .delete()
-            .eq('id', avatarId)
-            .eq('user_id', userId); // Double-check ownership for deletion
-
-        if (deleteDbError) {
-            console.error('Supabase Error deleting avatar from DB:', deleteDbError);
-            return res.status(500).json({ message: 'Error deleting avatar from database', error: deleteDbError.message });
-        }
-
-        // --- Now, delete associated files from Supabase Storage ---
-        const filesToDelete = [];
-        // Helper to extract bucket name and file path from a Supabase public URL
-        const getFilePath = (url) => {
-            if (!url) return null;
-            try {
-                const urlObj = new URL(url);
-                // Supabase public URL format: https://[project_id].supabase.co/storage/v1/object/public/[bucket_name]/[path_to_file]
-                const pathParts = urlObj.pathname.split('/');
-                // pathParts[0] is empty, pathParts[1] is 'storage', pathParts[2] is 'v1', pathParts[3] is 'object', pathParts[4] is 'public'
-                // pathParts[5] is the bucket_name, pathParts[6+] is the actual path within the bucket
-                const bucketName = pathParts[5];
-                const filePath = pathParts.slice(6).join('/'); // Reconstruct the path within the bucket
-                return { bucketName, filePath };
-            } catch (e) {
-                console.warn(`Invalid URL format detected for deletion: ${url}`, e);
-                return null; // Return null if URL is malformed
-            }
-        };
-
-        const imagePath = getFilePath(avatarToDelete.image_url);
-        if (imagePath) filesToDelete.push({ bucket: imagePath.bucketName, path: imagePath.filePath });
-
-        const voicePath = getFilePath(avatarToDelete.voice_url);
-        if (voicePath) filesToDelete.push({ bucket: voicePath.bucketName, path: voicePath.filePath });
-
-        const videoPath = getFilePath(avatarToDelete.video_url);
-        if (videoPath) filesToDelete.push({ bucket: videoPath.bucketName, path: videoPath.filePath });
-
-        // Iterate and attempt to delete each file
-        for (const fileInfo of filesToDelete) {
-            try {
-                const { error: storageError } = await supabaseAdmin.storage
-                    .from(fileInfo.bucket)
-                    .remove([fileInfo.path]); // .remove expects an array of paths
-
-                if (storageError) {
-                    console.error(`Supabase Storage Error deleting ${fileInfo.path} from bucket ${fileInfo.bucket}:`, storageError);
-                    // IMPORTANT: We log this error but do NOT return it to the client,
-                    // as the database record has already been successfully deleted.
-                    // This prevents a successful DB deletion from being reported as a failure
-                    // just because a storage file couldn't be removed (e.g., already gone).
-                } else {
-                    console.log(`Successfully deleted storage file: ${fileInfo.path}`);
-                }
-            } catch (storageCatchError) {
-                console.error(`Unexpected error during storage file deletion for ${fileInfo.path}:`, storageCatchError);
-            }
-        }
-
-        res.status(200).json({ message: 'Avatar and associated files deleted successfully.' });
-    } catch (err) {
-        console.error('Server error deleting avatar:', err);
-        res.status(500).json({ message: 'Internal server error during avatar deletion', error: err.message });
+    // Prepare update data
+    const updateData = {
+      updated_at: new Date().toISOString(),
     }
-};
+
+    if (name !== undefined) updateData.name = name?.trim() || null
+    if (image_url !== undefined) updateData.image_url = image_url?.trim() || null
+    if (voice_url !== undefined) updateData.voice_url = voice_url?.trim() || null
+    if (system_prompt !== undefined) updateData.system_prompt = system_prompt?.trim() || null
+    if (persona_role !== undefined) updateData.persona_role = persona_role?.trim() || null
+    if (conversational_context !== undefined) updateData.conversational_context = conversational_context?.trim() || null
+
+    const { data: avatar, error } = await supabaseAdmin
+      .from("avatars")
+      .update(updateData)
+      .eq("id", id)
+      .select()
+      .single()
+
+    if (error) {
+      console.error("Error updating avatar:", error)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update avatar",
+        error: error.message,
+      })
+    }
+
+    res.json({
+      success: true,
+      message: "Avatar updated successfully",
+      data: avatar,
+    })
+  } catch (error) {
+    console.error("Update avatar error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    })
+  }
+}
+
+/**
+ * Delete avatar
+ */
+export const deleteAvatar = async (req, res) => {
+  try {
+    const { id } = req.params
+    const userId = req.user.id
+
+    // Check if avatar exists and belongs to user
+    const { data: existingAvatar, error: fetchError } = await supabaseAdmin
+      .from("avatars")
+      .select("id, name")
+      .eq("id", id)
+      .eq("user_id", userId)
+      .single()
+
+    if (fetchError) {
+      if (fetchError.code === "PGRST116") {
+        return res.status(404).json({
+          success: false,
+          message: "Avatar not found",
+          code: "AVATAR_NOT_FOUND",
+        })
+      }
+      throw fetchError
+    }
+
+    // Delete related records first (conversations, chat history, etc.)
+    await supabaseAdmin.from("conversations").delete().eq("avatar_id", id)
+    await supabaseAdmin.from("chat_history").delete().eq("avatar_id", id)
+    await supabaseAdmin.from("video_generation_history").delete().eq("avatar_id", id)
+
+    // Delete the avatar
+    const { error: deleteError } = await supabaseAdmin.from("avatars").delete().eq("id", id)
+
+    if (deleteError) {
+      console.error("Error deleting avatar:", deleteError)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to delete avatar",
+        error: deleteError.message,
+      })
+    }
+
+    res.json({
+      success: true,
+      message: `Avatar "${existingAvatar.name}" deleted successfully`,
+    })
+  } catch (error) {
+    console.error("Delete avatar error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    })
+  }
+}
