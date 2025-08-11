@@ -8,11 +8,11 @@ import { fileURLToPath } from "url"
 
 // Import routes
 import indexRoutes from "./routes/index.js"
-import avatarRoutes from "./routes/avatarRoutes.js"
-import conversationRoutes from "./routes/conversationRoutes.js"
-import usageRoutes from "./routes/usageRoutes.js"
-import videoGenerationRoutes from "./routes/videoGenerationRoutes.js"
-import audioGenerationRoutes from "./routes/audioGenerationRoutes.js"
+// import avatarRoutes from "./routes/avatarRoutes.js"
+// import conversationRoutes from "./routes/conversationRoutes.js"
+// import usageRoutes from "./routes/usageRoutes.js"
+// import videoGenerationRoutes from "./routes/videoGenerationRoutes.js"
+// import audioGenerationRoutes from "./routes/audioGenerationRoutes.js"
 
 // Import WebSocket handlers
 import handleVoiceChat from "./ws/voiceChatHandler.js"
