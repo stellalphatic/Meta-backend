@@ -1,9 +1,11 @@
+import WebSocket from "ws"
 import { getGeminiResponse, getAvatarPersonalityFromDB } from "../services/gemini.js"
 import { supabaseAdmin } from "../services/supabase.js"
 import { updateConversationUsage } from "../middleware/usageLimitMiddleware.js"
 import { authenticateWebSocket } from "../middleware/authMiddleware.js"
-import WebSocket from "ws"
 import crypto from "crypto"
+import dotenv from "dotenv"
+dotenv.config()
 
 // Helper function to safely parse incoming WebSocket messages
 function parseIncomingMessage(message) {
@@ -35,6 +37,7 @@ async function handleVoiceChat(ws, req) {
   let avatarId
   let avatarDetails
   let voiceServiceWs = null
+  let isSpeaking = false
   let sessionId
   let language = "en"
   let conversationId = null
@@ -43,26 +46,55 @@ async function handleVoiceChat(ws, req) {
   let connectionTimeout = null
   const chatMessages = []
 
+  // Audio queue management (like your old code)
+  const audioQueue = []
+  let isProcessingAudio = false
+
   const DEFAULT_LLM_RESPONSE = "I'm having a little trouble with my connection. Could you please repeat that?"
 
-  try {
-    // Parse URL parameters
-    const urlParams = new URLSearchParams(req.url.split("?")[1])
-    avatarId = urlParams.get("avatarId")
-    const token = urlParams.get("token")
-    let voiceCloneUrl = urlParams.get("voiceUrl")
-    language = urlParams.get("language") || "en"
+  const urlParams = new URLSearchParams(req.url.split("?")[1])
+  avatarId = urlParams.get("avatarId")
+  const token = urlParams.get("token")
+  let voiceCloneUrl = urlParams.get("voiceUrl")
+  language = urlParams.get("language") || "en"
 
-    if (!avatarId || !token) {
-      console.error("Missing avatarId or token in WebSocket URL for voice chat.")
-      ws.send(
-        JSON.stringify({ type: "error", message: "Voice chat initialization failed: Missing avatar info or token." }),
-      )
-      ws.close()
+  if (!avatarId || !token) {
+    console.error("Missing avatarId or token in WebSocket URL for voice chat.")
+    ws.send(
+      JSON.stringify({ type: "error", message: "Voice chat initialization failed: Missing avatar info or token." }),
+    )
+    ws.close()
+    return
+  }
+
+  // Audio processing function (based on your old code logic)
+  const processAudioQueue = async () => {
+    if (isProcessingAudio || audioQueue.length === 0) {
       return
     }
 
-    // Authenticate user
+    isProcessingAudio = true
+
+    while (audioQueue.length > 0) {
+      const audioChunk = audioQueue.shift()
+
+      try {
+        // Send audio chunk to frontend immediately (no queuing delays)
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(audioChunk)
+        }
+
+        // Small delay to prevent overwhelming the client
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      } catch (error) {
+        console.error("Error processing audio chunk:", error)
+      }
+    }
+
+    isProcessingAudio = false
+  }
+
+  try {
     const user = await authenticateWebSocket(token)
     userId = user.id
     sessionId = crypto.randomUUID()
@@ -126,6 +158,7 @@ async function handleVoiceChat(ws, req) {
     }
 
     // Fetch avatar data
+    console.log(`[DB] Fetching avatar personality data for ${avatarId} from database.`)
     avatarDetails = await getAvatarPersonalityFromDB(avatarId)
     if (!avatarDetails) {
       console.error("Error loading avatar data for voice chat or avatar not found.")
@@ -139,17 +172,21 @@ async function handleVoiceChat(ws, req) {
       return
     }
 
-    // Use voice URL from database if not provided
+    console.log(`[DB] Avatar data fetched successfully for ${avatarDetails.name} (ID: ${avatarId})`)
+    console.log(`[DB] Voice URL: ${avatarDetails.voice_url ? "Present" : "Missing"}`)
+
+    // If voiceCloneUrl was NOT provided in the URL, use the one from Supabase
     if (!voiceCloneUrl) {
+      console.warn("voiceUrl not found in WebSocket URL. Using voice_url from Supabase.")
       voiceCloneUrl = avatarDetails.voice_url
     }
 
     if (!voiceCloneUrl) {
-      console.error("Avatar has no voice sample URL configured for voice chat.")
+      console.error("Avatar has no voice sample URL configured for voice chat (after checking URL and DB).")
       await ws.send(
         JSON.stringify({
           type: "error",
-          message: `Avatar "${avatarDetails.name}" doesn't have a voice sample configured. Please add a voice sample to this avatar first.`,
+          message: `Avatar "${avatarDetails.name}" doesn't have a voice sample configured. Please add a voice sample to this avatar first, or choose a different avatar with voice capabilities.`,
         }),
       )
 
@@ -161,7 +198,16 @@ async function handleVoiceChat(ws, req) {
       return
     }
 
-    // Connect to voice service
+    // Set connection timeout
+    connectionTimeout = setTimeout(() => {
+      if (!isFullyConnected) {
+        console.error("Voice chat service connection timeout")
+        ws.send(JSON.stringify({ type: "error", message: "Connection timeout. Please try again." }))
+        ws.close()
+      }
+    }, 15000) // 15 second timeout for voice
+
+    // Connect to Voice Service
     const voiceServiceSecretKey = process.env.VOICE_SERVICE_SECRET_KEY
     if (!voiceServiceSecretKey) {
       console.error("VOICE_SERVICE_SECRET_KEY environment variable is not set.")
@@ -175,7 +221,7 @@ async function handleVoiceChat(ws, req) {
       return
     }
 
-    // Generate auth token for voice service
+    // Generate the custom auth token for the Python service
     const timestamp = Math.floor(Date.now() / 1000)
     const stringToSign = `${timestamp}`
     const signature = crypto.createHmac("sha256", voiceServiceSecretKey).update(stringToSign).digest("hex")
@@ -190,17 +236,8 @@ async function handleVoiceChat(ws, req) {
       },
     })
 
-    // Set connection timeout
-    connectionTimeout = setTimeout(() => {
-      if (!isFullyConnected) {
-        console.error("Voice service connection timeout")
-        ws.send(JSON.stringify({ type: "error", message: "Connection timeout. Please try again." }))
-        ws.close()
-      }
-    }, 15000) // 15 second timeout
-
     voiceServiceWs.onopen = async () => {
-      console.log("🔗 Connected to Python Voice Service WS for voice chat")
+      console.log("✅ Connected to Python Voice Service WS for voice chat")
       await voiceServiceWs.send(
         JSON.stringify({
           type: "init",
@@ -216,7 +253,7 @@ async function handleVoiceChat(ws, req) {
       const pythonMessage = parseIncomingMessage(event.data)
       if (pythonMessage) {
         if (pythonMessage.type === "ready") {
-          console.log("✅ Python TTS is ready. Voice chat fully connected!")
+          console.log("✅ Python TTS is ready for voice chat.")
           isFullyConnected = true
 
           if (connectionTimeout) {
@@ -232,6 +269,11 @@ async function handleVoiceChat(ws, req) {
                 name: avatarDetails.name,
                 image_url: avatarDetails.image_url,
               },
+              features: {
+                voice: true,
+                video: false,
+                lip_sync: false,
+              },
             }),
           )
         } else if (pythonMessage.type === "error") {
@@ -241,20 +283,26 @@ async function handleVoiceChat(ws, req) {
             await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
           }
         } else if (pythonMessage.type === "speech_start") {
+          isSpeaking = true
           await ws.send(JSON.stringify({ type: "speech_start" }))
         } else if (pythonMessage.type === "speech_end") {
+          isSpeaking = false
           await ws.send(JSON.stringify({ type: "speech_end" }))
         }
       } else if (event.data instanceof Buffer || event.data instanceof ArrayBuffer) {
-        // Raw audio from Python service - send directly to frontend with no queuing
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(event.data)
+        // Handle raw audio data - use queue system like your old code
+        audioQueue.push(event.data)
+
+        // Process audio queue immediately (non-blocking)
+        if (!isProcessingAudio) {
+          processAudioQueue()
         }
       }
     }
 
     voiceServiceWs.onclose = (event) => {
       console.log("🔌 Python Voice Service WS closed for voice chat.", event.code, event.reason)
+      isSpeaking = false
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "system", message: "Voice service disconnected." }))
         ws.close(1001, "Python voice service disconnected")
@@ -263,13 +311,14 @@ async function handleVoiceChat(ws, req) {
 
     voiceServiceWs.onerror = (err) => {
       console.error("❌ Python Voice Service WS error for voice chat:", err)
+      isSpeaking = false
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "error", message: "Voice service connection failed. Please try again." }))
         ws.close(1011, "Voice service error")
       }
     }
   } catch (error) {
-    console.error("❌ Voice chat WebSocket handler initialization error:", error)
+    console.error("Voice chat WebSocket handler initialization error:", error)
     ws.send(JSON.stringify({ type: "error", message: "Failed to initialize voice chat session." }))
 
     if (conversationId) {
@@ -280,7 +329,6 @@ async function handleVoiceChat(ws, req) {
     return
   }
 
-  // Handle incoming messages
   ws.on("message", async (message) => {
     try {
       const parsedMessage = parseIncomingMessage(message)
@@ -308,7 +356,7 @@ async function handleVoiceChat(ws, req) {
           return
         }
 
-        // Get LLM response
+        // Call Gemini for LLM response
         let llmResponseText
         if (!userText || userText.trim().length < 2) {
           llmResponseText = DEFAULT_LLM_RESPONSE
@@ -334,23 +382,32 @@ async function handleVoiceChat(ws, req) {
           console.log("🛑 Received stop_speaking command from frontend. Forwarding to Python.")
           voiceServiceWs.send(JSON.stringify({ type: "stop_speaking" }))
         }
+
+        // Clear audio queue
+        audioQueue.length = 0
+        isProcessingAudio = false
+
+        isSpeaking = false
         await ws.send(JSON.stringify({ type: "speech_end" }))
       }
     } catch (error) {
-      console.error("[VOICE_CHAT] WebSocket message processing error:", error)
+      console.error("[VOICE_CHAT] WebSocket message processing error in main handler:", error)
       await ws.send(JSON.stringify({ type: "error", message: "Server error processing message." }))
     }
   })
 
-  // Handle connection close
   ws.on("close", async () => {
-    console.log("🔌 [VOICE_CHAT] Client disconnected. Cleaning up.")
+    console.log("[VOICE_CHAT] Client disconnected. Cleaning up.")
 
     // Clear timeout if still active
     if (connectionTimeout) {
       clearTimeout(connectionTimeout)
       connectionTimeout = null
     }
+
+    // Clear audio queue
+    audioQueue.length = 0
+    isProcessingAudio = false
 
     // Calculate conversation duration
     const conversationEndTime = new Date()
@@ -359,7 +416,7 @@ async function handleVoiceChat(ws, req) {
     try {
       // Update conversation record
       if (conversationId) {
-        // Generate summary
+        // Generate summary using Gemini
         let summary = ""
         if (chatMessages.length > 0) {
           try {
@@ -401,6 +458,7 @@ async function handleVoiceChat(ws, req) {
       // Update usage
       if (durationMinutes > 0) {
         await updateConversationUsage(userId, durationMinutes)
+        console.log(`Updated conversation usage for user ${userId}: +${durationMinutes} minutes`)
       }
     } catch (error) {
       console.error("Error saving conversation data:", error)
@@ -420,6 +478,10 @@ async function handleVoiceChat(ws, req) {
       clearTimeout(connectionTimeout)
       connectionTimeout = null
     }
+
+    // Clear audio queue
+    audioQueue.length = 0
+    isProcessingAudio = false
 
     if (voiceServiceWs && voiceServiceWs.readyState === WebSocket.OPEN) {
       console.log("[VOICE_CHAT] Closing Python Voice Service WS due to client error.")

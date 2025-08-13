@@ -16,11 +16,14 @@
     "debug": "~2.6.9",
     "dotenv": "^17.2.1",
     "express": "~4.16.1",
+    "form-data": "^4.0.4",
     "jsonwebtoken": "^9.0.2",
     "morgan": "~1.9.1",
+    "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
     "nodemon": "^3.1.10",
     "stripe": "^18.3.0",
+    "uuid": "^11.1.0",
     "ws": "^8.18.3"
   }
 }

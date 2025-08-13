@@ -1,6 +1,20 @@
 import { supabaseAdmin } from "../services/supabase.js"
+import { updateAudioUsage } from "../middleware/usageLimitMiddleware.js"
 import fetch from "node-fetch"
 import crypto from "crypto"
+import fs from "fs"
+import path from "path"
+import { fileURLToPath } from "url"
+import { exec } from "child_process"
+import { promisify } from "util"
+
+const execAsync = promisify(exec)
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+// In-memory processing queue
+const processingQueue = []
+let isProcessing = false
 
 /**
  * Generate authentication token for voice service
@@ -10,30 +24,186 @@ function generateVoiceServiceToken() {
   if (!secretKey) {
     throw new Error("VOICE_SERVICE_SECRET_KEY not configured")
   }
-
   const timestamp = Math.floor(Date.now() / 1000)
   const stringToSign = `${timestamp}`
   const signature = crypto.createHmac("sha256", secretKey).update(stringToSign).digest("hex")
   const payload = `${signature}.${timestamp}`
   const encodedPayload = Buffer.from(payload).toString("base64url")
-
   return `VOICE_CLONE_AUTH-${encodedPayload}`
 }
 
 /**
- * Generate audio using voice cloning service
+ * Estimate token count (more conservative: 1 token ≈ 3 characters for safety)
+ */
+function estimateTokenCount(text) {
+  return Math.ceil(text.length / 3)
+}
+
+/**
+ * Split text into chunks based on XTTS 400 token limit (very conservative: 200 tokens per chunk)
+ */
+function splitTextIntoChunks(text, maxTokens = 200) {
+  const maxChars = maxTokens * 3 // Very conservative: 200 tokens = 600 chars max
+  const sentences = text.split(/[.!?]+/).filter((s) => s.trim().length > 0)
+  const chunks = []
+  let currentChunk = ""
+
+  console.log(`[CHUNKING] Input text: ${text.length} chars, estimated ${estimateTokenCount(text)} tokens`)
+  console.log(`[CHUNKING] Target: max ${maxTokens} tokens (${maxChars} chars) per chunk`)
+
+  for (const sentence of sentences) {
+    const trimmedSentence = sentence.trim()
+    const potentialChunk = currentChunk ? `${currentChunk}. ${trimmedSentence}` : trimmedSentence
+
+    if (potentialChunk.length <= maxChars) {
+      currentChunk = potentialChunk
+    } else {
+      // Current chunk is full, save it and start new one
+      if (currentChunk) {
+        chunks.push(currentChunk + ".")
+        console.log(
+          `[CHUNKING] Created chunk: ${currentChunk.length} chars, ~${estimateTokenCount(currentChunk)} tokens`,
+        )
+      }
+
+      // If single sentence is too long, split by words
+      if (trimmedSentence.length > maxChars) {
+        const words = trimmedSentence.split(" ")
+        let wordChunk = ""
+
+        for (const word of words) {
+          const potentialWordChunk = wordChunk ? `${wordChunk} ${word}` : word
+
+          if (potentialWordChunk.length <= maxChars) {
+            wordChunk = potentialWordChunk
+          } else {
+            if (wordChunk) {
+              chunks.push(wordChunk)
+              console.log(
+                `[CHUNKING] Created word chunk: ${wordChunk.length} chars, ~${estimateTokenCount(wordChunk)} tokens`,
+              )
+            }
+            wordChunk = word
+          }
+        }
+
+        if (wordChunk) {
+          currentChunk = wordChunk
+        }
+      } else {
+        currentChunk = trimmedSentence
+      }
+    }
+  }
+
+  if (currentChunk) {
+    chunks.push(currentChunk + ".")
+    console.log(`[CHUNKING] Final chunk: ${currentChunk.length} chars, ~${estimateTokenCount(currentChunk)} tokens`)
+  }
+
+  const finalChunks = chunks.filter((chunk) => chunk.trim().length > 0)
+  console.log(`[CHUNKING] Total chunks created: ${finalChunks.length}`)
+
+  return finalChunks
+}
+
+/**
+ * Concatenate audio files using FFmpeg
+ */
+async function concatenateAudioFiles(audioBuffers, tempDir) {
+  if (audioBuffers.length === 1) {
+    console.log(`[AUDIO_CONCAT] Single chunk, no concatenation needed`)
+    return audioBuffers[0]
+  }
+
+  try {
+    console.log(`[AUDIO_CONCAT] Concatenating ${audioBuffers.length} audio chunks`)
+
+    // Create temporary directory if it doesn't exist
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true })
+    }
+
+    // Save individual audio buffers as temporary files
+    const tempFiles = []
+    const fileListPath = path.join(tempDir, `filelist_${Date.now()}.txt`)
+    let fileListContent = ""
+
+    for (let i = 0; i < audioBuffers.length; i++) {
+      const tempFilePath = path.join(tempDir, `chunk_${i}_${Date.now()}.wav`)
+      fs.writeFileSync(tempFilePath, Buffer.from(audioBuffers[i]))
+      tempFiles.push(tempFilePath)
+      fileListContent += `file '${tempFilePath}'\n`
+      console.log(`[AUDIO_CONCAT] Saved chunk ${i + 1}: ${audioBuffers[i].byteLength} bytes`)
+    }
+
+    // Write file list for FFmpeg concat
+    fs.writeFileSync(fileListPath, fileListContent)
+
+    // Output file path
+    const outputPath = path.join(tempDir, `concatenated_${Date.now()}.wav`)
+
+    // Use FFmpeg to concatenate audio files
+    const ffmpegCommand = `ffmpeg -f concat -safe 0 -i "${fileListPath}" -c copy "${outputPath}"`
+
+    console.log(`[AUDIO_CONCAT] Running FFmpeg command: ${ffmpegCommand}`)
+
+    await execAsync(ffmpegCommand)
+
+    // Read the concatenated file
+    const concatenatedBuffer = fs.readFileSync(outputPath)
+    console.log(`[AUDIO_CONCAT] Concatenated file size: ${concatenatedBuffer.byteLength} bytes`)
+
+    // Cleanup temporary files
+    tempFiles.forEach((file) => {
+      try {
+        fs.unlinkSync(file)
+      } catch (err) {
+        console.warn(`[AUDIO_CONCAT] Failed to delete temp file ${file}:`, err.message)
+      }
+    })
+
+    try {
+      fs.unlinkSync(fileListPath)
+      fs.unlinkSync(outputPath)
+    } catch (err) {
+      console.warn(`[AUDIO_CONCAT] Failed to delete temp files:`, err.message)
+    }
+
+    return concatenatedBuffer
+  } catch (error) {
+    console.error(`[AUDIO_CONCAT] Error concatenating audio:`, error)
+    throw new Error(`Audio concatenation failed: ${error.message}`)
+  }
+}
+
+/**
+ * Generate audio from text
  */
 export const generateAudio = async (req, res) => {
-  const { voiceId, text, language = "en" } = req.body
+  const { text, voiceId, language = "en" } = req.body
   const userId = req.user?.id
+  const isWithinLimit = req.isWithinAudioLimit !== false
 
-  console.log(`[AUDIO_GEN] Request from user ${userId} for voice ${voiceId}`)
+  console.log(`[AUDIO_GEN] Generate audio request:`, {
+    userId,
+    voiceId,
+    textLength: text?.length,
+    estimatedTokens: text ? estimateTokenCount(text) : 0,
+    language,
+  })
 
-  if (!voiceId || !text || !text.trim()) {
+  if (!text || !text.trim()) {
     return res.status(400).json({
       success: false,
-      message: "Missing voiceId or text for audio generation.",
-      code: "MISSING_PARAMETERS",
+      message: "Text is required.",
+    })
+  }
+
+  if (!voiceId) {
+    return res.status(400).json({
+      success: false,
+      message: "Voice ID is required.",
     })
   }
 
@@ -41,255 +211,338 @@ export const generateAudio = async (req, res) => {
     return res.status(401).json({
       success: false,
       message: "Authentication required.",
-      code: "AUTH_REQUIRED",
     })
   }
 
-  // Check if user is within audio generation limits
-  if (req.isWithinAudioLimit === false) {
+  if (!isWithinLimit) {
     return res.status(403).json({
       success: false,
       message: "You have exceeded your monthly audio generation limit.",
-      code: "USAGE_LIMIT_EXCEEDED",
       usageInfo: req.audioUsageInfo,
     })
   }
 
-  let generatedAudioRecord = null
+  // Check text length - limit to 1000 characters
+  const textLength = text.trim().length
+  const estimatedTokens = estimateTokenCount(text.trim())
+
+  if (textLength > 1000) {
+    return res.status(400).json({
+      success: false,
+      message: "Text is too long. Maximum 1000 characters allowed.",
+    })
+  }
+
+  console.log(`[AUDIO_GEN] Text analysis: ${textLength} chars, ~${estimatedTokens} tokens`)
 
   try {
-    // 1. Fetch voice details
-    const { data: voiceData, error: voiceError } = await supabaseAdmin
-      .from("voices")
-      .select("name, audio_url")
-      .eq("id", voiceId)
-      .single()
-
-    if (voiceError || !voiceData) {
-      console.error(`[AUDIO_GEN] Error fetching voice details for ${voiceId}:`, voiceError)
-      return res.status(404).json({
-        success: false,
-        message: "Voice not found or accessible.",
-        code: "VOICE_NOT_FOUND",
-      })
-    }
-
-    const { audio_url: voiceCloneUrl } = voiceData
-
-    if (!voiceCloneUrl) {
-      console.error(`[AUDIO_GEN] Voice ${voiceId} is missing audio URL.`)
-      return res.status(400).json({
-        success: false,
-        message: "Voice is not properly configured for audio generation.",
-        code: "VOICE_INCOMPLETE",
-      })
-    }
-
-    // 2. Create initial record in database
-    try {
-      const { data, error: insertError } = await supabaseAdmin
-        .from("generated_audios")
-        .insert({
-          user_id: userId,
-          voice_id: voiceId,
-          text_input: text,
-          language: language,
-          audio_url: "", // Will be updated when generation completes
-          status: "generating",
-          error_message: null,
-          created_at: new Date().toISOString(),
-          timestamp: new Date().toISOString(),
-        })
-        .select()
-        .single()
-
-      if (insertError) {
-        console.error("[AUDIO_GEN] Error saving audio metadata:", insertError)
-        throw new Error(`Database error: ${insertError.message}`)
-      }
-
-      generatedAudioRecord = data
-      console.log(`[AUDIO_GEN] Audio record saved with ID: ${generatedAudioRecord.id}`)
-    } catch (dbError) {
-      console.error("[AUDIO_GEN] Database operation failed:", dbError)
-      return res.status(500).json({
-        success: false,
-        message: "Failed to save audio generation record.",
-        code: "DATABASE_ERROR",
-        error: dbError.message,
-      })
-    }
-
-    // 3. Generate Audio from Text
-    console.log(`[AUDIO_GEN] Generating audio from text...`)
-    const voiceServiceBaseUrl = process.env.COQUI_XTTS_BASE_URL
-
-    if (!voiceServiceBaseUrl) {
-      await supabaseAdmin
-        .from("generated_audios")
-        .update({
-          status: "failed",
-          error_message: "Voice service not configured",
-        })
-        .eq("id", generatedAudioRecord.id)
-
-      return res.status(500).json({
-        success: false,
-        message: "Voice service not configured.",
-        code: "SERVICE_NOT_CONFIGURED",
-      })
-    }
-
-    // Generate proper authentication token for voice service
-    const voiceServiceToken = generateVoiceServiceToken()
-    console.log(`[AUDIO_GEN] Generated voice service token: ${voiceServiceToken.substring(0, 20)}...`)
-
-    const audioResponse = await fetch(`${voiceServiceBaseUrl}/generate-audio`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: voiceServiceToken,
-      },
-      body: JSON.stringify({
-        voice_id: voiceId,
-        voice_clone_url: voiceCloneUrl,
-        text: text,
-        language: language,
-      }),
-    })
-
-    if (!audioResponse.ok) {
-      const errorText = await audioResponse.text()
-      console.error("[AUDIO_GEN] Voice service error:", audioResponse.status, errorText)
-
-      await supabaseAdmin
-        .from("generated_audios")
-        .update({
-          status: "failed",
-          error_message: `Voice service error: ${errorText}`,
-        })
-        .eq("id", generatedAudioRecord.id)
-
-      return res.status(audioResponse.status).json({
-        success: false,
-        message: `Failed to generate audio: ${errorText}`,
-        code: "AUDIO_GENERATION_FAILED",
-      })
-    }
-
-    console.log(`[AUDIO_GEN] Audio generation successful`)
-    const audioBlob = await audioResponse.blob()
-
-    // Upload audio to storage
-    const audioFileName = `generated_audios/${userId}/${generatedAudioRecord.id}-${Date.now()}.wav`
-    const { data: audioUploadData, error: audioUploadError } = await supabaseAdmin.storage
-      .from("avatar-media")
-      .upload(audioFileName, audioBlob, {
-        contentType: "audio/wav",
-        upsert: false,
-      })
-
-    if (audioUploadError) {
-      console.error("[AUDIO_GEN] Error uploading audio:", audioUploadError)
-
-      await supabaseAdmin
-        .from("generated_audios")
-        .update({
-          status: "failed",
-          error_message: "Failed to store generated audio",
-        })
-        .eq("id", generatedAudioRecord.id)
-
-      return res.status(500).json({
-        success: false,
-        message: "Failed to store generated audio.",
-        code: "AUDIO_UPLOAD_FAILED",
-      })
-    }
-
-    const { data: audioUrlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(audioFileName)
-    const audioUrl = audioUrlData.publicUrl
-    console.log(`[AUDIO_GEN] Audio uploaded to: ${audioUrl}`)
-
-    // Update database record with final URL
-    const { data: updatedRecord, error: updateError } = await supabaseAdmin
+    // Create record in database with exact schema match
+    const { data: audioRecord, error: insertError } = await supabaseAdmin
       .from("generated_audios")
-      .update({
-        audio_url: audioUrl,
-        status: "completed",
+      .insert({
+        user_id: userId,
+        voice_id: voiceId,
+        text_input: text.trim(),
+        language: language,
+        audio_url: "", // Required field, will be updated when processing completes
+        created_at: new Date().toISOString(),
+        timestamp: new Date().toISOString(),
+        status: "queued",
+        error_message: null,
       })
-      .eq("id", generatedAudioRecord.id)
       .select()
       .single()
 
-    if (updateError) {
-      console.error("[AUDIO_GEN] Error updating record:", updateError)
+    if (insertError) {
+      console.error("[AUDIO_GEN] Error creating record:", insertError)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create audio generation record.",
+        error: insertError.message,
+      })
     }
 
-    // Update user's audio generation usage
-    try {
-      const { data: profile, error: fetchError } = await supabaseAdmin
-        .from("profiles")
-        .select("audio_generation_this_month")
-        .eq("id", userId)
-        .single()
+    console.log(`[AUDIO_GEN] Created record: ${audioRecord.id}`)
 
-      if (!fetchError && profile) {
-        const currentUsage = profile.audio_generation_this_month || 0
-        const newUsage = currentUsage + 1
+    // Add to processing queue
+    processingQueue.push({
+      id: audioRecord.id,
+      userId,
+      voiceId,
+      text: text.trim(),
+      language,
+    })
 
-        await supabaseAdmin
-          .from("profiles")
-          .update({
-            audio_generation_this_month: newUsage,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", userId)
-
-        console.log(`[AUDIO_GEN] Updated audio usage for user ${userId}: +1 generation (total: ${newUsage})`)
-      }
-    } catch (usageError) {
-      console.error("[AUDIO_GEN] Error updating usage:", usageError)
+    // Start processing if not already running
+    if (!isProcessing) {
+      processQueue().catch((error) => {
+        console.error("[AUDIO_GEN] Queue processing error:", error)
+      })
     }
 
+    const estimatedChunks = Math.ceil(estimatedTokens / 200)
     res.status(200).json({
       success: true,
-      message: "Audio generated successfully!",
+      message: "Audio generation started successfully.",
       data: {
-        record: updatedRecord || generatedAudioRecord,
-        audioUrl: audioUrl,
-        usageInfo: req.audioUsageInfo,
+        record: audioRecord,
+        audioId: audioRecord.id,
+        status: "queued",
+        estimatedTime: estimatedChunks > 1 ? "60-120 seconds" : "30-60 seconds",
+        chunks: estimatedChunks,
       },
     })
-  } catch (err) {
-    console.error("[AUDIO_GEN] Server error:", err)
-
-    // If we have a record, mark it as failed
-    if (generatedAudioRecord) {
-      try {
-        await supabaseAdmin
-          .from("generated_audios")
-          .update({
-            status: "failed",
-            error_message: err.message,
-          })
-          .eq("id", generatedAudioRecord.id)
-      } catch (updateError) {
-        console.error("[AUDIO_GEN] Failed to update error status:", updateError)
-      }
-    }
-
+  } catch (error) {
+    console.error("[AUDIO_GEN] Error in generateAudio:", error)
     res.status(500).json({
       success: false,
-      message: "Internal server error during audio generation.",
-      code: "INTERNAL_ERROR",
-      error: err.message,
+      message: "Failed to start audio generation.",
+      error: error.message,
     })
   }
 }
 
 /**
- * Get user's audio generation history
+ * Process the audio generation queue with aggressive text chunking and audio concatenation
+ */
+async function processQueue() {
+  if (isProcessing || processingQueue.length === 0) {
+    return
+  }
+
+  isProcessing = true
+  console.log(`[AUDIO_GEN] Processing queue with ${processingQueue.length} tasks`)
+
+  while (processingQueue.length > 0) {
+    const task = processingQueue.shift()
+    console.log(`[AUDIO_GEN] Processing task ${task.id}`)
+
+    try {
+      // Update status to processing
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          status: "processing",
+          timestamp: new Date().toISOString(),
+        })
+        .eq("id", task.id)
+
+      // Get voice details - try both tables for compatibility
+      let voice = null
+      let voiceError = null
+
+      // First try 'voices' table
+      const { data: voiceData, error: voicesError } = await supabaseAdmin
+        .from("voices")
+        .select("*")
+        .eq("id", task.voiceId)
+        .single()
+
+      if (!voicesError && voiceData?.audio_url) {
+        voice = voiceData
+      } else {
+        // Fallback to 'avatars' table
+        const { data: avatarData, error: avatarsError } = await supabaseAdmin
+          .from("avatars")
+          .select("*")
+          .eq("id", task.voiceId)
+          .single()
+
+        if (!avatarsError && avatarData?.voice_url) {
+          voice = { ...avatarData, audio_url: avatarData.voice_url }
+        } else {
+          voiceError = voicesError || avatarsError
+        }
+      }
+
+      if (!voice || !voice.audio_url) {
+        throw new Error("Voice not found or voice URL missing")
+      }
+
+      console.log(`[AUDIO_GEN] Using voice: ${voice.name || "Unknown"} with URL: ${voice.audio_url}`)
+
+      // Split text into very small chunks to ensure we stay under XTTS limits
+      const textChunks = splitTextIntoChunks(task.text, 200) // Very conservative: 200 tokens max
+      console.log(`[AUDIO_GEN] Split text into ${textChunks.length} chunks for processing`)
+
+      const audioBuffers = []
+      const voiceServiceUrl = process.env.COQUI_XTTS_BASE_URL
+
+      if (!voiceServiceUrl) {
+        throw new Error("Voice service not configured")
+      }
+
+      // Generate audio for each chunk
+      for (let i = 0; i < textChunks.length; i++) {
+        const chunk = textChunks[i]
+        console.log(
+          `[AUDIO_GEN] Processing chunk ${i + 1}/${textChunks.length}: "${chunk.substring(0, 50)}..." (${chunk.length} chars, ~${estimateTokenCount(chunk)} tokens)`,
+        )
+
+        const voiceServiceToken = generateVoiceServiceToken()
+
+        const response = await fetch(`${voiceServiceUrl}/generate-audio`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: voiceServiceToken,
+          },
+          body: JSON.stringify({
+            voice_id: task.voiceId,
+            voice_clone_url: voice.audio_url,
+            text: chunk,
+            language: task.language,
+          }),
+        })
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          console.error(`[AUDIO_GEN] Voice service error for chunk ${i + 1}:`, errorText)
+          throw new Error(`Voice service error for chunk ${i + 1}: ${response.status}: ${errorText}`)
+        }
+
+        const audioBuffer = await response.arrayBuffer()
+        console.log(`[AUDIO_GEN] Chunk ${i + 1} audio buffer size: ${audioBuffer.byteLength} bytes`)
+
+        if (audioBuffer.byteLength === 0) {
+          throw new Error(`Generated audio for chunk ${i + 1} is empty`)
+        }
+
+        audioBuffers.push(audioBuffer)
+
+        // Longer delay between chunks to avoid overwhelming the service
+        if (i < textChunks.length - 1) {
+          console.log(`[AUDIO_GEN] Waiting 3 seconds before next chunk...`)
+          await new Promise((resolve) => setTimeout(resolve, 3000))
+        }
+      }
+
+      // Concatenate audio files if multiple chunks
+      let finalAudioBuffer
+      if (audioBuffers.length > 1) {
+        console.log(`[AUDIO_GEN] Concatenating ${audioBuffers.length} audio chunks`)
+        const tempDir = path.join(__dirname, "..", "temp", "audio")
+        finalAudioBuffer = await concatenateAudioFiles(audioBuffers, tempDir)
+        console.log(`[AUDIO_GEN] Concatenated audio buffer size: ${finalAudioBuffer.byteLength} bytes`)
+      } else {
+        finalAudioBuffer = Buffer.from(audioBuffers[0])
+        console.log(`[AUDIO_GEN] Single chunk audio buffer size: ${finalAudioBuffer.byteLength} bytes`)
+      }
+
+      // Upload to storage
+      const fileName = `generated_audio/${task.userId}/${task.id}-${Date.now()}.wav`
+      const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+        .from("avatar-media")
+        .upload(fileName, finalAudioBuffer, {
+          contentType: "audio/wav",
+        })
+
+      if (uploadError) {
+        throw new Error(`Storage upload failed: ${uploadError.message}`)
+      }
+
+      const { data: urlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(fileName)
+      const audioUrl = urlData.publicUrl
+
+      console.log(`[AUDIO_GEN] Audio uploaded to: ${audioUrl}`)
+
+      // Update record with success
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          audio_url: audioUrl,
+          status: "completed",
+          error_message: null,
+          timestamp: new Date().toISOString(),
+        })
+        .eq("id", task.id)
+
+      // Update usage - calculate duration based on text length and word count
+      const words = task.text.trim().split(/\s+/).length
+      const estimatedDuration = Math.max(0.5, words / 150.0) // 150 words per minute
+      console.log(`[AUDIO_GEN] Updating usage: ${words} words = ${estimatedDuration.toFixed(2)} minutes`)
+      await updateAudioUsage(task.userId, estimatedDuration)
+
+      console.log(`[AUDIO_GEN] Task ${task.id} completed successfully with ${textChunks.length} chunks`)
+    } catch (error) {
+      console.error(`[AUDIO_GEN] Task ${task.id} failed:`, error)
+
+      // Update record with error
+      await supabaseAdmin
+        .from("generated_audios")
+        .update({
+          status: "failed",
+          error_message: error.message,
+          timestamp: new Date().toISOString(),
+        })
+        .eq("id", task.id)
+    }
+  }
+
+  isProcessing = false
+  console.log(`[AUDIO_GEN] Queue processing completed`)
+}
+
+/**
+ * Get audio generation status
+ */
+export const getAudioStatus = async (req, res) => {
+  const { taskId } = req.params
+  const userId = req.user?.id
+
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    })
+  }
+
+  try {
+    const { data: audio, error } = await supabaseAdmin
+      .from("generated_audios")
+      .select("*")
+      .eq("id", taskId)
+      .eq("user_id", userId)
+      .single()
+
+    if (error || !audio) {
+      return res.status(404).json({
+        success: false,
+        message: "Audio generation task not found.",
+      })
+    }
+
+    // Calculate progress based on status
+    let progress = 0
+    if (audio.status === "queued") progress = 10
+    else if (audio.status === "processing") progress = 50
+    else if (audio.status === "completed") progress = 100
+    else if (audio.status === "failed") progress = 0
+
+    res.status(200).json({
+      success: true,
+      data: {
+        taskId: audio.id,
+        status: audio.status,
+        progress: progress,
+        audio_url: audio.audio_url,
+        error_message: audio.error_message,
+        created_at: audio.created_at,
+        timestamp: audio.timestamp,
+      },
+    })
+  } catch (error) {
+    console.error("Error fetching audio status:", error)
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch audio status.",
+      error: error.message,
+    })
+  }
+}
+
+/**
+ * Get user's generated audio history
  */
 export const getAudioHistory = async (req, res) => {
   const userId = req.user?.id
@@ -298,44 +551,86 @@ export const getAudioHistory = async (req, res) => {
     return res.status(401).json({
       success: false,
       message: "Authentication required.",
-      code: "AUTH_REQUIRED",
     })
   }
 
   try {
-    const { data, error } = await supabaseAdmin
+    // Get audio generation history without join since there's no foreign key
+    const { data: audios, error: audiosError } = await supabaseAdmin
       .from("generated_audios")
-      .select(`
-        *,
-        voices (
-          name
-        )
-      `)
+      .select("*")
       .eq("user_id", userId)
       .order("created_at", { ascending: false })
+      .limit(50)
 
-    if (error) throw error
+    if (audiosError) {
+      console.error(`[AUDIO_GEN] Error fetching audio history:`, audiosError)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch audio history",
+        error: audiosError.message,
+      })
+    }
+
+    // Get voice names separately from both tables
+    const voiceIds = [...new Set(audios.map((audio) => audio.voice_id).filter(Boolean))]
+    let voicesMap = {}
+
+    if (voiceIds.length > 0) {
+      // Try voices table first
+      const { data: voices, error: voicesError } = await supabaseAdmin
+        .from("voices")
+        .select("id, name")
+        .in("id", voiceIds)
+
+      if (!voicesError && voices) {
+        voicesMap = voices.reduce((acc, voice) => {
+          acc[voice.id] = voice
+          return acc
+        }, {})
+      }
+
+      // Fill in missing voices from avatars table
+      const missingVoiceIds = voiceIds.filter((id) => !voicesMap[id])
+      if (missingVoiceIds.length > 0) {
+        const { data: avatars, error: avatarsError } = await supabaseAdmin
+          .from("avatars")
+          .select("id, name")
+          .in("id", missingVoiceIds)
+
+        if (!avatarsError && avatars) {
+          avatars.forEach((avatar) => {
+            voicesMap[avatar.id] = avatar
+          })
+        }
+      }
+    }
+
+    // Add voice names to audios
+    const audiosWithVoices = audios.map((audio) => ({
+      ...audio,
+      voices: voicesMap[audio.voice_id] || { name: "Unknown Voice" },
+    }))
 
     res.status(200).json({
       success: true,
       data: {
-        audios: data || [],
-        total: data?.length || 0,
+        audios: audiosWithVoices || [],
+        total: audiosWithVoices?.length || 0,
       },
     })
-  } catch (err) {
-    console.error("[AUDIO_HISTORY] Error:", err)
+  } catch (error) {
+    console.error(`[AUDIO_GEN] Get audio history error:`, error)
     res.status(500).json({
       success: false,
-      message: "Error fetching audio history.",
-      code: "AUDIO_HISTORY_ERROR",
-      error: err.message,
+      message: "Internal server error",
+      error: error.message,
     })
   }
 }
 
 /**
- * Delete a generated audio record
+ * Delete generated audio
  */
 export const deleteAudio = async (req, res) => {
   const { audioId } = req.params
@@ -345,7 +640,6 @@ export const deleteAudio = async (req, res) => {
     return res.status(401).json({
       success: false,
       message: "Authentication required.",
-      code: "AUTH_REQUIRED",
     })
   }
 
@@ -353,12 +647,11 @@ export const deleteAudio = async (req, res) => {
     return res.status(400).json({
       success: false,
       message: "Audio ID is required.",
-      code: "MISSING_AUDIO_ID",
     })
   }
 
   try {
-    // First, get the audio record to check ownership and get file URL
+    // Get the audio record to check ownership and get file URL
     const { data: audio, error: fetchError } = await supabaseAdmin
       .from("generated_audios")
       .select("*")
@@ -370,14 +663,12 @@ export const deleteAudio = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Audio not found or you don't have permission to delete it.",
-        code: "AUDIO_NOT_FOUND",
       })
     }
 
     // Delete the audio file from storage if it exists
-    if (audio.audio_url) {
+    if (audio.audio_url && audio.audio_url.trim() !== "") {
       try {
-        // Extract file path from URL
         const urlParts = audio.audio_url.split("/avatar-media/")
         if (urlParts.length > 1) {
           const filePath = urlParts[1]
@@ -386,7 +677,6 @@ export const deleteAudio = async (req, res) => {
         }
       } catch (storageError) {
         console.warn("[AUDIO_DELETE] Failed to delete audio file from storage:", storageError)
-        // Continue with database deletion even if file deletion fails
       }
     }
 
@@ -412,7 +702,6 @@ export const deleteAudio = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error deleting audio.",
-      code: "AUDIO_DELETE_ERROR",
       error: error.message,
     })
   }

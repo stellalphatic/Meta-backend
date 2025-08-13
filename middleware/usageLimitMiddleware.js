@@ -1,6 +1,140 @@
 import { supabaseAdmin } from "../services/supabase.js"
 
 /**
+ * Get user's current usage statistics
+ */
+export const getUserUsageStats = async (req, res) => {
+  const userId = req.user?.id
+
+  if (!userId) {
+    return res.status(401).json({
+      message: "Authentication required.",
+    })
+  }
+
+  try {
+    // Get user's profile with all usage data
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .select(`
+        current_plan,
+        conversation_minutes_monthly_limit,
+        conversation_minutes_this_month,
+        video_generation_minutes_monthly_limit,
+        video_generation_minutes_this_month,
+        custom_avatar_creations_monthly_limit,
+        custom_avatar_creations_this_month,
+        audio_generation_minutes_monthly_limit,
+        audio_generation_minutes_this_month,
+        last_billing_date
+      `)
+      .eq("id", userId)
+      .single()
+
+    if (profileError || !profile) {
+      throw new Error("Error fetching user profile")
+    }
+
+    // Calculate percentages and remaining usage
+    const videoUsed = profile.video_generation_minutes_this_month || 0
+    const videoLimit = profile.video_generation_minutes_monthly_limit || 0
+    const videoPercentage = videoLimit > 0 ? Math.min(100, (videoUsed / videoLimit) * 100) : 0
+
+    const conversationUsed = profile.conversation_minutes_this_month || 0
+    const conversationLimit = profile.conversation_minutes_monthly_limit || 0
+    const conversationPercentage =
+      conversationLimit > 0 ? Math.min(100, (conversationUsed / conversationLimit) * 100) : 0
+
+    const audioUsed = profile.audio_generation_minutes_this_month || 0
+    const audioLimit = profile.audio_generation_minutes_monthly_limit || 0
+    const audioPercentage = audioLimit > 0 ? Math.min(100, (audioUsed / audioLimit) * 100) : 0
+
+    const avatarUsed = profile.custom_avatar_creations_this_month || 0
+    const avatarLimit = profile.custom_avatar_creations_monthly_limit || 0
+    const avatarPercentage = avatarLimit > 0 ? Math.min(100, (avatarUsed / avatarLimit) * 100) : 0
+
+    const responseData = {
+      success: true,
+      data: {
+        currentPlan: profile.current_plan,
+        videoGeneration: {
+          used: videoUsed,
+          limit: videoLimit,
+          remaining: Math.max(0, videoLimit - videoUsed),
+          percentage: videoPercentage,
+        },
+        conversation: {
+          used: conversationUsed,
+          limit: conversationLimit,
+          remaining: Math.max(0, conversationLimit - conversationUsed),
+          percentage: conversationPercentage,
+        },
+        audioGeneration: {
+          used: audioUsed,
+          limit: audioLimit,
+          remaining: Math.max(0, audioLimit - audioUsed),
+          percentage: audioPercentage,
+        },
+        avatarCreation: {
+          used: avatarUsed,
+          limit: avatarLimit,
+          remaining: Math.max(0, avatarLimit - avatarUsed),
+          percentage: avatarPercentage,
+        },
+        billingPeriod: {
+          lastBillingDate: profile.last_billing_date,
+          nextBillingDate: getNextBillingDate(profile.last_billing_date),
+        },
+        // Legacy format for backward compatibility
+        audioMinutesUsed: audioUsed,
+        audioMinutesLimit: audioLimit,
+        videoMinutesUsed: videoUsed,
+        videoMinutesLimit: videoLimit,
+      },
+    }
+
+    res.status(200).json(responseData)
+  } catch (error) {
+    console.error("Error getting usage stats:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error fetching usage statistics.",
+      error: error.message,
+    })
+  }
+}
+
+/**
+ * Reset monthly usage for a user
+ */
+export const resetMonthlyUsage = async (userId) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from("profiles")
+      .update({
+        avatars_created_this_month: 0,
+        conversation_minutes_this_month: 0,
+        videos_generated_this_month: 0,
+        audio_generation_minutes_this_month: 0,
+        last_usage_reset: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", userId)
+
+    if (error) {
+      console.error("Error resetting monthly usage:", error)
+      throw error
+    }
+
+    console.log(`Monthly usage reset for user: ${userId}`)
+    return true
+  } catch (error) {
+    console.error("Error in resetMonthlyUsage:", error)
+    throw error
+  }
+}
+
+/**
  * Middleware to check video generation limits
  */
 export const checkVideoLimit = async (req, res, next) => {
@@ -83,7 +217,7 @@ export const checkAudioLimit = async (req, res, next) => {
     // Get user's profile to check limits and current usage
     const { data: profile, error: profileError } = await supabaseAdmin
       .from("profiles")
-      .select("current_plan, audio_generation_monthly_limit, audio_generation_this_month")
+      .select("current_plan, audio_generation_minutes_monthly_limit, audio_generation_minutes_this_month")
       .eq("id", userId)
       .single()
 
@@ -94,17 +228,23 @@ export const checkAudioLimit = async (req, res, next) => {
       })
     }
 
-    const monthlyLimit = profile.audio_generation_monthly_limit || 0
-    const currentUsage = profile.audio_generation_this_month || 0
+    const monthlyLimit = profile.audio_generation_minutes_monthly_limit || 0
+    const currentUsage = profile.audio_generation_minutes_this_month || 0
+
+    // Estimate duration for current request based on word count
+    const textLength = req.body.text?.length || 0
+    const words = req.body.text?.trim().split(/\s+/).length || 0
+    const estimatedDuration = Math.max(0.5, words / 150.0) // 150 words per minute
 
     // Check if user would exceed limit
-    const wouldExceedLimit = currentUsage + 1 > monthlyLimit
+    const wouldExceedLimit = currentUsage + estimatedDuration > monthlyLimit
 
-    // Add usage info to request for controller
+    // Add usage info to request
     req.audioUsageInfo = {
       currentUsage: currentUsage,
       monthlyLimit: monthlyLimit,
-      remainingGenerations: Math.max(0, monthlyLimit - currentUsage),
+      estimatedDuration: estimatedDuration,
+      remainingMinutes: Math.max(0, monthlyLimit - currentUsage),
       currentPlan: profile.current_plan,
     }
 
@@ -112,7 +252,7 @@ export const checkAudioLimit = async (req, res, next) => {
 
     if (wouldExceedLimit) {
       return res.status(403).json({
-        message: `Audio generation would exceed your monthly limit of ${monthlyLimit} generations. Current usage: ${currentUsage} generations.`,
+        message: `Audio generation would exceed your monthly limit of ${monthlyLimit} minutes. Current usage: ${currentUsage.toFixed(1)} minutes.`,
         usageInfo: req.audioUsageInfo,
       })
     }
@@ -286,6 +426,44 @@ export const updateVideoUsage = async (userId, durationMinutes) => {
 }
 
 /**
+ * Update audio generation usage after successful generation
+ */
+export const updateAudioUsage = async (userId, durationMinutes) => {
+  try {
+    // Get current usage first
+    const { data: profile, error: fetchError } = await supabaseAdmin
+      .from("profiles")
+      .select("audio_generation_minutes_this_month")
+      .eq("id", userId)
+      .single()
+
+    if (fetchError) {
+      console.error("Error fetching current audio usage:", fetchError)
+      return
+    }
+
+    const currentUsage = profile.audio_generation_minutes_this_month || 0
+    const newUsage = currentUsage + durationMinutes
+
+    const { error } = await supabaseAdmin
+      .from("profiles")
+      .update({
+        audio_generation_minutes_this_month: newUsage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", userId)
+
+    if (error) {
+      console.error("Error updating audio usage:", error)
+    } else {
+      console.log(`Updated audio usage for user ${userId}: +${durationMinutes} minutes (total: ${newUsage})`)
+    }
+  } catch (error) {
+    console.error("Error in updateAudioUsage:", error)
+  }
+}
+
+/**
  * Update conversation usage after chat session
  */
 export const updateConversationUsage = async (userId, durationMinutes) => {
@@ -362,104 +540,6 @@ export const updateAvatarCreationUsage = async (userId) => {
 }
 
 /**
- * Get usage statistics for a user
- */
-export const getUserUsageStats = async (req, res) => {
-  const userId = req.user?.id
-
-  if (!userId) {
-    return res.status(401).json({
-      success: false,
-      message: "Authentication required.",
-    })
-  }
-
-  try {
-    // Get user's profile with all usage data
-    const { data: profile, error: profileError } = await supabaseAdmin
-      .from("profiles")
-      .select(`
-        current_plan,
-        conversation_minutes_monthly_limit,
-        conversation_minutes_this_month,
-        video_generation_minutes_monthly_limit,
-        video_generation_minutes_this_month,
-        custom_avatar_creations_monthly_limit,
-        custom_avatar_creations_this_month,
-        audio_generation_monthly_limit,
-        audio_generation_this_month,
-        last_billing_date
-      `)
-      .eq("id", userId)
-      .single()
-
-    if (profileError || !profile) {
-      throw new Error("Error fetching user profile")
-    }
-
-    // Calculate percentages and remaining usage
-    const videoUsed = profile.video_generation_minutes_this_month || 0
-    const videoLimit = profile.video_generation_minutes_monthly_limit || 0
-    const videoPercentage = videoLimit > 0 ? Math.min(100, (videoUsed / videoLimit) * 100) : 0
-
-    const conversationUsed = profile.conversation_minutes_this_month || 0
-    const conversationLimit = profile.conversation_minutes_monthly_limit || 0
-    const conversationPercentage =
-      conversationLimit > 0 ? Math.min(100, (conversationUsed / conversationLimit) * 100) : 0
-
-    const avatarUsed = profile.custom_avatar_creations_this_month || 0
-    const avatarLimit = profile.custom_avatar_creations_monthly_limit || 0
-    const avatarPercentage = avatarLimit > 0 ? Math.min(100, (avatarUsed / avatarLimit) * 100) : 0
-
-    const audioUsed = profile.audio_generation_this_month || 0
-    const audioLimit = profile.audio_generation_monthly_limit || 0
-    const audioPercentage = audioLimit > 0 ? Math.min(100, (audioUsed / audioLimit) * 100) : 0
-
-    res.status(200).json({
-      success: true,
-      data: {
-        currentPlan: profile.current_plan,
-        videoGeneration: {
-          used: videoUsed,
-          limit: videoLimit,
-          remaining: Math.max(0, videoLimit - videoUsed),
-          percentage: videoPercentage,
-        },
-        conversation: {
-          used: conversationUsed,
-          limit: conversationLimit,
-          remaining: Math.max(0, conversationLimit - conversationUsed),
-          percentage: conversationPercentage,
-        },
-        avatarCreation: {
-          used: avatarUsed,
-          limit: avatarLimit,
-          remaining: Math.max(0, avatarLimit - avatarUsed),
-          percentage: avatarPercentage,
-        },
-        audioGeneration: {
-          used: audioUsed,
-          limit: audioLimit,
-          remaining: Math.max(0, audioLimit - audioUsed),
-          percentage: audioPercentage,
-        },
-        billingPeriod: {
-          lastBillingDate: profile.last_billing_date,
-          nextBillingDate: getNextBillingDate(profile.last_billing_date),
-        },
-      },
-    })
-  } catch (error) {
-    console.error("Error getting usage stats:", error)
-    res.status(500).json({
-      success: false,
-      message: "Error fetching usage statistics.",
-      error: error.message,
-    })
-  }
-}
-
-/**
  * Calculate next billing date (monthly)
  */
 function getNextBillingDate(lastBillingDate) {
@@ -481,14 +561,12 @@ export const updateConversationUsageAPI = async (req, res) => {
 
   if (!userId) {
     return res.status(401).json({
-      success: false,
       message: "Authentication required.",
     })
   }
 
   if (!durationMinutes || durationMinutes <= 0) {
     return res.status(400).json({
-      success: false,
       message: "Invalid duration provided.",
     })
   }
@@ -515,25 +593,20 @@ export const updateConversationUsageAPI = async (req, res) => {
  * API endpoint to update avatar creation usage
  */
 export const updateAvatarCreationUsageAPI = async (req, res) => {
-  const { increment = 1 } = req.body
   const userId = req.user?.id
 
   if (!userId) {
     return res.status(401).json({
-      success: false,
       message: "Authentication required.",
     })
   }
 
   try {
-    for (let i = 0; i < increment; i++) {
-      await updateAvatarCreationUsage(userId)
-    }
+    await updateAvatarCreationUsage(userId)
 
     res.status(200).json({
       success: true,
       message: "Avatar creation usage updated successfully.",
-      increment: increment,
     })
   } catch (error) {
     console.error("Error updating avatar creation usage:", error)
