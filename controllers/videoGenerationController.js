@@ -8,7 +8,12 @@ import WebSocket from 'ws'; // This is a placeholder, as your voice service uses
 
 // In-memory processing queue
 const videoQueue = []
-let isProcessingVideo = false
+// let isProcessingVideo = false
+
+
+// Concurrency control
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "3", 10); // Set to 2 or 3 for L4 GPU
+let activeJobs = 0;
 
 // Cache for avatar details
 const avatarDetailsCache = new Map()
@@ -168,11 +173,12 @@ export const generateVideo = async (req, res) => {
         })
 
         // Start processing if not already running
-        if (!isProcessingVideo) {
-            processVideoQueue().catch((error) => {
-                console.error("[VIDEO_GEN] Queue processing error:", error)
-            })
-        }
+        // if (!isProcessingVideo) {
+        //     processVideoQueue().catch((error) => {
+        //         console.error("[VIDEO_GEN] Queue processing error:", error)
+        //     })
+        // }
+        processVideoQueue();
 
         res.status(200).json({
             success: true,
@@ -198,49 +204,65 @@ export const generateVideo = async (req, res) => {
  * Process the video generation queue
  */
 async function processVideoQueue() {
-    if (isProcessingVideo || videoQueue.length === 0) {
-        return
-    }
+    // if (isProcessingVideo || videoQueue.length === 0) {
+    //     return
+    // }
 
-    isProcessingVideo = true
+    // isProcessingVideo = true
     console.log(`[VIDEO_GEN] Processing queue with ${videoQueue.length} tasks`)
 
-    while (videoQueue.length > 0) {
+    while (videoQueue.length > 0 && activeJobs < MAX_CONCURRENT_JOBS) {
         const task = videoQueue.shift()
         console.log(`[VIDEO_GEN] Starting async processing for task ${task.id}`)
+             activeJobs++;
 
-        try {
-            // Update status to processing
-            await supabaseAdmin
-                .from("video_generation_history")
-                .update({
-                    status: "processing",
-                    progress: 20,
-                })
-                .eq("id", task.id)
-
-            console.log(`[VIDEO_GEN] Task ${task.id} status updated: processing (20%)`)
-
-            // Process video generation
-            await processVideoGeneration(task)
-        } catch (error) {
-            console.error(`[VIDEO_GEN] Task ${task.id} failed:`, error)
-
-            // Update record with error
-            await supabaseAdmin
-                .from("video_generation_history")
-                .update({
-                    status: "failed",
-                    error_message: error.message,
-                    progress: 0,
-                })
-                .eq("id", task.id)
-
-            console.log(`[VIDEO_GEN] Task ${task.id} status updated: failed (0%)`)
-        }
+        // Update status to processing BEFORE starting the async job
+        supabaseAdmin
+            .from("video_generation_history")
+            .update({
+                status: "processing",
+                progress: 20,
+            })
+            .eq("id", task.id)
+            .then(() => {
+                console.log(`[VIDEO_GEN] Task ${task.id} status updated: processing (20%)`);
+                // Start the job asynchronously
+                processVideoGeneration(task)
+                    .catch(async (error) => {
+                        console.error(`[VIDEO_GEN] Task ${task.id} failed:`, error);
+                        // Update record with error
+                        await supabaseAdmin
+                            .from("video_generation_history")
+                            .update({
+                                status: "failed",
+                                error_message: error.message,
+                                progress: 0,
+                            })
+                            .eq("id", task.id);
+                        console.log(`[VIDEO_GEN] Task ${task.id} status updated: failed (0%)`);
+                    })
+                    .finally(() => {
+                        activeJobs--;
+                        processVideoQueue();
+                    });
+            })
+            .catch((error) => {
+                // If updating to processing fails, mark as failed and continue
+                console.error(`[VIDEO_GEN] Failed Task ${task.id}:`, error);
+                supabaseAdmin
+                    .from("video_generation_history")
+                    .update({
+                        status: "failed",
+                        error_message: error.message,
+                        progress: 0,
+                    })
+                    .eq("id", task.id);
+                activeJobs--;
+                processVideoQueue();
+            });
     }
 
-    isProcessingVideo = false
+    // isProcessingVideo = false
     console.log(`[VIDEO_GEN] Queue processing completed`)
 }
 
