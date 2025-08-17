@@ -404,7 +404,7 @@ async function processVideoGeneration(task) {
  * Background function to poll video completion
  */
 async function _pollVideoCompletion(taskId, videoRecordId, quality, prompt, userId) {
-    const maxAttempts = quality === "high" ? 120 : 60
+    const maxAttempts = quality === "high" ? 240 : 120
     const pollInterval = quality === "high" ? 5000 : 3000
     const videoGenBaseUrl = process.env.VIDEO_SERVICE_URL
 
