@@ -12,7 +12,7 @@ const videoQueue = []
 
 
 // Concurrency control
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10); // Set to 2 or 3 for L4 GPU
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "2", 10); // Set to 2 or 3 for L4 GPU
 let activeJobs = 0;
 
 // Cache for avatar details
@@ -405,7 +405,7 @@ async function processVideoGeneration(task) {
  */
 async function _pollVideoCompletion(taskId, videoRecordId, quality, prompt, userId) {
     const maxAttempts = quality === "high" ? 240 : 120
-    const pollInterval = quality === "high" ? 12000 : 5000 // 12seconds : 5 seconds
+    const pollInterval = quality === "high" ? 85000 : 5000 // 8.5seconds : 5 seconds
     const videoGenBaseUrl = process.env.VIDEO_SERVICE_URL
 
     console.log(`[VIDEO_GEN] Starting background polling for task ${taskId}`)
