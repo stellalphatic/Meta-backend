@@ -12,7 +12,7 @@ const videoQueue = []
 
 
 // Concurrency control
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "3", 10); // Set to 2 or 3 for L4 GPU
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10); // Set to 2 or 3 for L4 GPU
 let activeJobs = 0;
 
 // Cache for avatar details
