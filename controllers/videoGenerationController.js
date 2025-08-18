@@ -4,16 +4,20 @@ import fetch from "node-fetch"
 import FormData from "form-data"
 import crypto from "crypto"
 import WebSocket from 'ws'; // This is a placeholder, as your voice service uses websockets
+import multer from "multer";
 
+// Multer for receiving MP4 from worker
+const videoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 300 * 1024 * 1024 }, // 300MB
+});
 
 // In-memory processing queue
 const videoQueue = []
 // let isProcessingVideo = false
 
 
-// Concurrency control
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "2", 10); // Set to 2 or 3 for L4 GPU
-let activeJobs = 0;
+
 
 // Cache for avatar details
 const avatarDetailsCache = new Map()
@@ -51,460 +55,138 @@ function generateVoiceServiceToken() {
  * Generate video from text/audio and avatar
  */
 export const generateVideo = async (req, res) => {
-    const { text, avatarId, quality = "standard", audioUrl, inputType } = req.body
-    const userId = req.user?.id
-    const isWithinLimit = req.isWithinLimit !== false
+  const { text, avatarId, quality = "standard", audioUrl, inputType } = req.body;
+  const userId = req.user?.id;
+  const isWithinLimit = req.isWithinLimit !== false;
 
-    console.log(`[VIDEO_GEN] Request from user ${userId} for avatar ${avatarId}, inputType: ${inputType}`)
+  if (!userId) return res.status(401).json({ success: false, message: "Authentication required." });
+  if (!avatarId) return res.status(400).json({ success: false, message: "Avatar ID is required." });
+  if (inputType === "script" && (!text || !text.trim()))
+    return res.status(400).json({ success: false, message: "Text is required for script-to-video generation." });
+  if (inputType === "audio" && !audioUrl)
+    return res.status(400).json({ success: false, message: "Audio URL is required for audio-to-video generation." });
+  if (!isWithinLimit)
+    return res.status(403).json({ success: false, message: "You have exceeded your monthly limit.", usageInfo: req.usageInfo });
 
-    // Validation
-    if (inputType === "script" && (!text || !text.trim())) {
-        return res.status(400).json({
-            success: false,
-            message: "Text is required for script-to-video generation.",
-        })
+  if (text && text.trim().length > 500)
+    return res.status(400).json({ success: false, message: "Text is too long. Max 500 chars." });
+
+  try {
+    // 1) avatar details (cached)
+    let avatarDetails;
+    if (!avatarDetailsCache.has(avatarId)) {
+      const { data, error } = await supabaseAdmin
+        .from("avatars")
+        .select("name, image_url, voice_url")
+        .eq("id", avatarId)
+        .single();
+      if (error || !data) return res.status(404).json({ success: false, message: "Avatar not found." });
+      avatarDetailsCache.set(avatarId, data);
+    }
+    avatarDetails = avatarDetailsCache.get(avatarId);
+    if (inputType === "script" && !avatarDetails.voice_url)
+      return res.status(400).json({ success: false, message: "Avatar is missing a voice." });
+
+    // 2) create DB record
+    const { data: videoRecord, error: insertError } = await supabaseAdmin
+      .from("video_generation_history")
+      .insert({
+        user_id: userId,
+        avatar_id: avatarId,
+        prompt: text || null,
+        quality,
+        audio_url: audioUrl || null,
+        video_url: "",
+        status: "queued",
+        progress: 0,
+        error_message: null,
+        input_type: inputType || "script",
+        created_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+    if (insertError) {
+      console.error("[VIDEO_GEN] record create error:", insertError);
+      return res.status(500).json({ success: false, message: "Failed to create record." });
     }
 
-    if (inputType === "audio" && !audioUrl) {
-        return res.status(400).json({
-            success: false,
-            message: "Audio URL is required for audio-to-video generation.",
-        })
-    }
+    // 3) if script → call voice, upload to Supabase
+    let finalAudioUrl = audioUrl || null;
+    if (inputType === "script") {
+      const voiceServiceBaseUrl = process.env.COQUI_XTTS_BASE_URL;
+      if (!voiceServiceBaseUrl) throw new Error("Voice service not configured.");
+      const voiceServiceToken = generateVoiceServiceToken();
 
-    if (!avatarId) {
-        return res.status(400).json({
-            success: false,
-            message: "Avatar ID is required.",
-        })
-    }
-
-    if (!userId) {
-        return res.status(401).json({
-            success: false,
-            message: "Authentication required.",
-        })
-    }
-
-    if (!isWithinLimit) {
-        return res.status(403).json({
-            success: false,
-            message: "You have exceeded your monthly video generation limit.",
-            usageInfo: req.usageInfo,
-        })
-    }
-
-    // Check text length
-    if (text && text.trim().length > 500) {
-        return res.status(400).json({
-            success: false,
-            message: "Text is too long. Maximum 500 characters allowed.",
-        })
-    }
-
-    try {
-        // Get avatar details from cache or DB
-        let avatarDetails
-        if (!avatarDetailsCache.has(avatarId)) {
-            const { data, error } = await supabaseAdmin
-                .from("avatars")
-                .select("name, image_url, voice_url")
-                .eq("id", avatarId)
-                .single()
-            if (error || !data) {
-                return res.status(404).json({
-                    success: false,
-                    message: "Avatar not found or accessible.",
-                })
-            }
-            avatarDetailsCache.set(avatarId, data)
-        }
-        avatarDetails = avatarDetailsCache.get(avatarId)
-
-        if (inputType === "script" && !avatarDetails.voice_url) {
-            return res.status(400).json({
-                success: false,
-                message: "Avatar is missing a voice for script-to-video generation.",
-            })
-        }
-
-        console.log(`[VIDEO_GEN] Avatar found: ${avatarDetails.name}, image_url: ${avatarDetails.image_url}`)
-
-        // Create record in video_generation_history table
-        const { data: videoRecord, error: insertError } = await supabaseAdmin
-            .from("video_generation_history")
-            .insert({
-                user_id: userId,
-                avatar_id: avatarId,
-                prompt: text || null,
-                quality: quality,
-                audio_url: audioUrl || null,
-                video_url: "",
-                status: "queued",
-                progress: 0,
-                error_message: null,
-                input_type: inputType || "script",
-                created_at: new Date().toISOString(),
-            })
-            .select()
-            .single()
-
-        if (insertError) {
-            console.error("[VIDEO_GEN] Error creating record:", insertError)
-            return res.status(500).json({
-                success: false,
-                message: "Failed to create video generation record.",
-                error: insertError.message,
-            })
-        }
-
-        console.log(`[VIDEO_GEN] Video record created with ID: ${videoRecord.id}`)
-
-        // Add to processing queue
-        videoQueue.push({
-            id: videoRecord.id,
-            userId,
-            avatarId,
-            avatar: avatarDetails,
-            text: text || null,
-            quality,
-            audioUrl,
-            inputType,
-        })
-
-        // Start processing if not already running
-        // if (!isProcessingVideo) {
-        //     processVideoQueue().catch((error) => {
-        //         console.error("[VIDEO_GEN] Queue processing error:", error)
-        //     })
-        // }
-        processVideoQueue();
-
-        res.status(200).json({
-            success: true,
-            message: "Video generation started successfully.",
-            data: {
-                taskId: videoRecord.id,
-                status: "queued",
-                estimatedTime: "2-5 minutes",
-            },
-        })
-    } catch (error) {
-        console.error("[VIDEO_GEN] Error in generateVideo:", error)
-        res.status(500).json({
-            success: false,
-            message: "Failed to start video generation.",
-            error: error.message,
-        })
-    }
-}
-
-// ------------------------------------------------------------------------------------------------------
-/**
- * Process the video generation queue
- */
-async function processVideoQueue() {
-    // if (isProcessingVideo || videoQueue.length === 0) {
-    //     return
-    // }
-
-    // isProcessingVideo = true
-    console.log(`[VIDEO_GEN] Processing queue with ${videoQueue.length} tasks`)
-
-    while (videoQueue.length > 0 && activeJobs < MAX_CONCURRENT_JOBS) {
-        const task = videoQueue.shift()
-        console.log(`[VIDEO_GEN] Starting async processing for task ${task.id}`)
-             activeJobs++;
-
-        // Update status to processing BEFORE starting the async job
-        supabaseAdmin
-            .from("video_generation_history")
-            .update({
-                status: "processing",
-                progress: 20,
-            })
-            .eq("id", task.id)
-            .then(() => {
-                console.log(`[VIDEO_GEN] Task ${task.id} status updated: processing (20%)`);
-                // Start the job asynchronously
-                processVideoGeneration(task)
-                    .catch(async (error) => {
-                        console.error(`[VIDEO_GEN] Task ${task.id} failed:`, error);
-                        // Update record with error
-                        await supabaseAdmin
-                            .from("video_generation_history")
-                            .update({
-                                status: "failed",
-                                error_message: error.message,
-                                progress: 0,
-                            })
-                            .eq("id", task.id);
-                        console.log(`[VIDEO_GEN] Task ${task.id} status updated: failed (0%)`);
-                    })
-                    .finally(() => {
-                        activeJobs--;
-                        processVideoQueue();
-                    });
-            })
-            .catch((error) => {
-                // If updating to processing fails, mark as failed and continue
-                console.error(`[VIDEO_GEN] Failed Task ${task.id}:`, error);
-                supabaseAdmin
-                    .from("video_generation_history")
-                    .update({
-                        status: "failed",
-                        error_message: error.message,
-                        progress: 0,
-                    })
-                    .eq("id", task.id);
-                activeJobs--;
-                processVideoQueue();
-            });
-    }
-
-    // isProcessingVideo = false
-    console.log(`[VIDEO_GEN] Queue processing completed`)
-}
-
-// ------------------------------------------------------------------------------------------------------
-/**
- * Process individual video generation task
- */
-async function processVideoGeneration(task) {
-    console.log(`[VIDEO_GEN] Generating video for task ${task.id}`)
-
-    const videoServiceUrl = process.env.VIDEO_SERVICE_URL
-    if (!videoServiceUrl) {
-        throw new Error("Video service URL not configured")
-    }
-
-    let finalAudioUrl = task.audioUrl
-    let cleanupAudioFile = false
-
-    // Step 1: If input is a script, generate audio first
-    if (task.inputType === "script" && task.text) {
-        console.log(`[VIDEO_GEN] Input type is 'script'. Generating audio from text...`)
-        
-        const voiceServiceBaseUrl = process.env.COQUI_XTTS_BASE_URL
-        if (!voiceServiceBaseUrl) {
-            throw new Error("Voice service not configured.")
-        }
-
-        try {
-            const voiceServiceToken = generateVoiceServiceToken()
-            const audioResponse = await fetch(`${voiceServiceBaseUrl}/generate-audio`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    Authorization: voiceServiceToken,
-                },
-                body: JSON.stringify({
-                    voice_id: task.avatarId,
-                    voice_clone_url: task.avatar.voice_url,
-                    text: task.text,
-                    language: "en", 
-                }),
-            });
-
-            if (!audioResponse.ok) {
-                const errorText = await audioResponse.text()
-                throw new Error(`Failed to generate audio from voice service: ${errorText}`)
-            }
-
-            const audioBuffer = await audioResponse.arrayBuffer()
-
-            const audioFileName = `temp_audio/${task.userId}/${task.id}-${Date.now()}.wav`
-            const { data: audioUploadData, error: audioUploadError } = await supabaseAdmin.storage
-                .from("avatar-media")
-                .upload(audioFileName, audioBuffer, {
-                    contentType: "audio/wav",
-                    upsert: false,
-                });
-
-            if (audioUploadError) {
-                throw new Error(`Failed to upload generated audio: ${audioUploadError.message}`);
-            }
-
-            const { data: urlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(audioFileName);
-            finalAudioUrl = urlData.publicUrl;
-            task.tempAudioFileName = audioFileName;
-            cleanupAudioFile = true;
-
-            console.log(`[VIDEO_GEN] Audio generated and uploaded successfully: ${finalAudioUrl}`);
-
-        } catch (error) {
-            console.error(`[VIDEO_GEN] Error during audio generation for task ${task.id}:`, error);
-            throw new Error(`Audio generation failed: ${error.message}`);
-        }
-    }
-
-    if (!finalAudioUrl) {
-        throw new Error("Missing audio URL for video generation.");
-    }
-    
-    // Update progress after audio generation
-    await supabaseAdmin
-        .from("video_generation_history")
-        .update({ progress: 50, audio_url: finalAudioUrl })
-        .eq("id", task.id);
-
-    console.log(`[VIDEO_GEN] Calling video service at ${videoServiceUrl}/generate-video`)
-
-    // Step 2: Call the video service with the final audio URL
-    const formData = new FormData()
-    formData.append("image_url", task.avatar.image_url)
-    formData.append("audio_url", finalAudioUrl)
-    formData.append("quality", task.quality)
-
-    const videoServiceToken = generateVideoServiceToken()
-    const response = await fetch(`${videoServiceUrl}/generate-video`, {
+      const audioResponse = await fetch(`${voiceServiceBaseUrl}/generate-audio`, {
         method: "POST",
-        headers: {
-            Authorization: videoServiceToken,
-            ...formData.getHeaders(),
-        },
-        body: formData,
-    })
+        headers: { "Content-Type": "application/json", Authorization: voiceServiceToken },
+        body: JSON.stringify({
+          voice_id: avatarId,
+          voice_clone_url: avatarDetails.voice_url,
+          text,
+          language: "en",
+        }),
+      });
 
-    if (!response.ok) {
-        const errorText = await response.text()
-        console.error(`[VIDEO_GEN] Video service error: ${response.status}: ${errorText}`)
-        throw new Error(`Video service error: ${errorText}`)
-    }
+      if (!audioResponse.ok) {
+        const errorText = await audioResponse.text();
+        throw new Error(`Voice generation failed: ${errorText}`);
+      }
 
-    const result = await response.json()
-    if (!result.task_id) {
-        throw new Error("Video service did not return a task ID")
-    }
+      const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+      const audioFileName = `temp_audio/${userId}/${videoRecord.id}-${Date.now()}.wav`;
+      const { error: audioUploadError } = await supabaseAdmin.storage
+        .from("avatar-media")
+        .upload(audioFileName, audioBuffer, { contentType: "audio/wav", upsert: false });
+      if (audioUploadError) throw new Error(`Upload audio failed: ${audioUploadError.message}`);
+      const { data: urlData } = await supabaseAdmin.storage.from("avatar-media").getPublicUrl(audioFileName);
+      finalAudioUrl = urlData.publicUrl;
 
-    const videoServiceTaskId = result.task_id
-    console.log(`[VIDEO_GEN] Video service task ID: ${videoServiceTaskId}`)
-
-    // Update the DB record with the video service task ID
-    await supabaseAdmin
+      await supabaseAdmin
         .from("video_generation_history")
-        .update({ task_id: videoServiceTaskId, progress: 70 })
-        .eq("id", task.id)
-        
-    // Step 3: Poll for completion
-    await _pollVideoCompletion(videoServiceTaskId, task.id, task.quality, task.text, task.userId)
-
-    // Step 4: Cleanup temporary audio file if it was generated
-    if (cleanupAudioFile && task.tempAudioFileName) {
-        try {
-            await supabaseAdmin.storage.from("avatar-media").remove([task.tempAudioFileName]);
-            console.log(`[VIDEO_GEN] Cleaned up temp audio: ${task.tempAudioFileName}`);
-        } catch (cleanupError) {
-            console.warn("[VIDEO_GEN] Failed to cleanup temp audio:", cleanupError);
-        }
-    }
-}
-// ------------------------------------------------------------------------------------------------------
-/**
- * Background function to poll video completion
- */
-async function _pollVideoCompletion(taskId, videoRecordId, quality, prompt, userId) {
-    const maxAttempts = quality === "high" ? 240 : 120
-    const pollInterval = quality === "high" ? 85000 : 5000 // 8.5seconds : 5 seconds
-    const videoGenBaseUrl = process.env.VIDEO_SERVICE_URL
-
-    console.log(`[VIDEO_GEN] Starting background polling for task ${taskId}`)
-
-    let attempts = 0
-    let videoCompleted = false
-    let videoUrl = null
-
-    while (attempts < maxAttempts && !videoCompleted) {
-        await new Promise((resolve) => setTimeout(resolve, pollInterval))
-        attempts++
-
-        try {
-            const statusResponse = await fetch(`${videoGenBaseUrl}/video-status/${taskId}`, {
-                headers: {
-                    Authorization: generateVideoServiceToken(),
-                },
-            })
-
-            if (statusResponse.ok) {
-                const contentType = statusResponse.headers.get("content-type")
-
-                if (contentType && contentType.includes("video/mp4")) {
-                    console.log(`[VIDEO_GEN] Video ready for task ${taskId}, downloading...`)
-                    const videoBuffer = await statusResponse.arrayBuffer()
-                    
-                    if (videoBuffer.byteLength === 0) {
-                        console.error(`[VIDEO_GEN] Downloaded video is empty for task ${taskId}`)
-                        continue
-                    }
-
-                    const videoFileName = `generated_videos/${videoRecordId}/${quality}-${Date.now()}.mp4`
-                    const { error: videoUploadError } = await supabaseAdmin.storage
-                        .from("avatar-media")
-                        .upload(videoFileName, videoBuffer, { contentType: "video/mp4", upsert: false })
-
-                    if (videoUploadError) {
-                        throw new Error(`Failed to store generated video: ${videoUploadError.message}`)
-                    }
-
-                    const { data: videoUrlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(videoFileName)
-                    videoUrl = videoUrlData.publicUrl
-
-                    await supabaseAdmin
-                        .from("video_generation_history")
-                        .update({ video_url: videoUrl, status: "completed", completed_at: new Date().toISOString(), progress: 100 })
-                        .eq("id", videoRecordId)
-
-                    const estimatedDuration = Math.max(0.5, (prompt?.length || 60) * 0.01)
-                    await updateVideoUsage(userId, estimatedDuration)
-
-                    console.log(`[VIDEO_GEN] Video generation completed for task ${taskId}`)
-                    console.log(`[VIDEO_GEN] Video URL: ${videoUrl}`)
-                    videoCompleted = true
-                } else {
-                    const statusResult = await statusResponse.json()
-                    console.log(`[VIDEO_GEN] Task ${taskId} status: ${statusResult.status || "processing"} (attempt ${attempts})`)
-                    if (statusResult.status === "failed") {
-                        throw new Error(`Video generation failed: ${statusResult.error || "Unknown error"}`)
-                    }
-                }
-            } else if (statusResponse.status === 404) {
-                console.log(`[VIDEO_GEN] Task ${taskId} not found (attempt ${attempts})`)
-            } else {
-                console.log(`[VIDEO_GEN] Status check failed for task ${taskId}: ${statusResponse.status} (attempt ${attempts})`)
-            }
-        } catch (pollError) {
-            console.error(`[VIDEO_GEN] Error polling (attempt ${attempts}):`, pollError.message)
-            if (attempts >= maxAttempts) {
-                await supabaseAdmin
-                    .from("video_generation_history")
-                    .update({
-                        status: "failed",
-                        error_message: pollError.message,
-                        completed_at: new Date().toISOString(),
-                    })
-                    .eq("id", videoRecordId)
-            }
-        }
+        .update({ audio_url: finalAudioUrl, progress: 50 })
+        .eq("id", videoRecord.id);
     }
 
-    if (!videoCompleted) {
-        console.error(`[VIDEO_GEN] Video generation timed out for task ${taskId}`)
-        await supabaseAdmin
-            .from("video_generation_history")
-            .update({
-                status: "failed",
-                error_message: "Video generation timed out",
-                completed_at: new Date().toISOString(),
-            })
-            .eq("id", videoRecordId)
+    // 4) Call video-service /generate-video (it just enqueues → returns fast)
+    const videoServiceUrl = process.env.VIDEO_SERVICE_URL;
+    if (!videoServiceUrl) throw new Error("VIDEO_SERVICE_URL not configured");
+
+    const formData = new FormData();
+    formData.append("image_url", avatarDetails.image_url);
+    formData.append("audio_url", finalAudioUrl);
+    formData.append("quality", quality);
+
+    const response = await fetch(`${videoServiceUrl}/generate-video`, {
+      method: "POST",
+      headers: {
+        Authorization: process.env.VIDEO_SERVICE_API_KEY, // your existing auth
+        ...formData.getHeaders(),
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const t = await response.text();
+      throw new Error(`Video-service error: ${t}`);
     }
-}
+    const { task_id } = await response.json();
+    if (!task_id) throw new Error("Video-service did not return task_id");
 
-// ------------------------------------------------------------------------------------------------------
+    // 5) store worker task id, keep status queued
+    await supabaseAdmin.from("video_generation_history").update({ task_id }).eq("id", videoRecord.id);
 
-/**
- * Get video generation status
- */
+    return res.status(200).json({
+      success: true,
+      message: "Video enqueued.",
+      data: { taskId: videoRecord.id, status: "queued" },
+    });
+  } catch (error) {
+    console.error("[VIDEO_GEN] error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+
 export const getVideoStatus = async (req, res) => {
     const { taskId } = req.params
     const userId = req.user?.id
@@ -790,3 +472,100 @@ export const uploadAudioForVideo = async (req, res) => {
         })
     }
 }
+
+
+// handle worker -> backend callback (status + optional file)
+export const handleWorkerCallback = [
+  videoUpload.single("file"), // expects field name "file"
+  async (req, res) => {
+    try {
+      const { task_id: taskId, status, error } = req.body;
+
+      if (!taskId || !status) {
+        return res.status(400).json({ success: false, message: "task_id and status required" });
+      }
+
+      // Locate the DB record (your id is your taskId)
+      const { data: rec, error: findErr } = await supabaseAdmin
+        .from("video_generation_history")
+        .select("user_id, prompt")
+        .eq("id", taskId)
+        .single();
+
+      if (findErr || !rec) {
+        return res.status(404).json({ success: false, message: "Task not found" });
+      }
+
+      if (status === "processing") {
+        await supabaseAdmin
+          .from("video_generation_history")
+          .update({ status: "processing", progress: 70 })
+          .eq("id", taskId);
+        return res.json({ success: true });
+      }
+
+      if (status === "failed") {
+        await supabaseAdmin
+          .from("video_generation_history")
+          .update({
+            status: "failed",
+            error_message: error || "Worker failed",
+            progress: 0,
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", taskId);
+        return res.json({ success: true });
+      }
+
+      if (status === "completed") {
+        // Expecting MP4 file in req.file
+        if (!req.file) {
+          return res.status(400).json({ success: false, message: "Missing file for completed task" });
+        }
+
+        // Save to Supabase Storage
+        const path = `generated_videos/${taskId}/${Date.now()}.mp4`;
+        const { error: upErr } = await supabaseAdmin.storage
+          .from("avatar-media")
+          .upload(path, req.file.buffer, { contentType: "video/mp4", upsert: false });
+        if (upErr) {
+          // If upload fails, mark as failed
+          await supabaseAdmin
+            .from("video_generation_history")
+            .update({
+              status: "failed",
+              error_message: `Upload failed: ${upErr.message}`,
+              progress: 0,
+              completed_at: new Date().toISOString(),
+            })
+            .eq("id", taskId);
+          return res.status(500).json({ success: false, message: upErr.message });
+        }
+
+        const { data: urlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(path);
+        const videoUrl = urlData.publicUrl;
+
+        await supabaseAdmin
+          .from("video_generation_history")
+          .update({
+            video_url: videoUrl,
+            status: "completed",
+            progress: 100,
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", taskId);
+
+        // Update usage (rough estimate if script provided)
+        const estimatedDuration = Math.max(0.5, (rec?.prompt?.length || 60) * 0.01);
+        await updateVideoUsage(rec.user_id, estimatedDuration);
+
+        return res.json({ success: true, video_url: videoUrl });
+      }
+
+      return res.status(400).json({ success: false, message: `Unknown status: ${status}` });
+    } catch (e) {
+      console.error("[CALLBACK] Error:", e);
+      return res.status(500).json({ success: false, message: e.message });
+    }
+  },
+];

@@ -9,8 +9,10 @@ import {
   getVideoStatus,
   getVideoOptions,
   deleteVideo,
+  handleWorkerCallback
 } from "../controllers/videoGenerationController.js"
 
+import { verifyWorkerToken } from "../middleware/workerAuth.js"
 const router = express.Router()
 
 // Configure multer for audio file uploads
@@ -37,5 +39,10 @@ router.post("/upload-audio", authenticateJWT, upload.single("audio"), uploadAudi
 router.get("/history", authenticateJWT, getVideoHistory)
 router.get("/status/:taskId", authenticateJWT, getVideoStatus)
 router.delete("/:videoId", authenticateJWT, deleteVideo)
+
+//  worker (video-service) pushes status and file here (NO user auth, but secured by shared secret)
+router.post("/callback", verifyWorkerToken, handleWorkerCallback);
+
+
 
 export default router
