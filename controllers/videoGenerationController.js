@@ -17,7 +17,9 @@ const videoQueue = []
 // let isProcessingVideo = false
 
 
-
+// Concurrency control
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "2", 10); // Set to 2 or 3 for L4 GPU
+let activeJobs = 0;
 
 // Cache for avatar details
 const avatarDetailsCache = new Map()
@@ -169,24 +171,140 @@ export const generateVideo = async (req, res) => {
       const t = await response.text();
       throw new Error(`Video-service error: ${t}`);
     }
-    const { task_id } = await response.json();
-    if (!task_id) throw new Error("Video-service did not return task_id");
 
-    // 5) store worker task id, keep status queued
-    await supabaseAdmin.from("video_generation_history").update({ task_id }).eq("id", videoRecord.id);
+    const result = await response.json()
+    if (!result.task_id) {
+        throw new Error("Video service did not return a task ID")
+    }
 
-    return res.status(200).json({
-      success: true,
-      message: "Video enqueued.",
-      data: { taskId: videoRecord.id, status: "queued" },
-    });
-  } catch (error) {
-    console.error("[VIDEO_GEN] error:", error);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
+    const videoServiceTaskId = result.task_id
+    console.log(`[VIDEO_GEN] Video service task ID: ${videoServiceTaskId}`)
 
+    // Update the DB record with the video service task ID
+    await supabaseAdmin
+        .from("video_generation_history")
+        .update({ task_id: videoServiceTaskId, progress: 70 })
+        .eq("id", task.id)
+        
+    // Step 3: Poll for completion
+    await _pollVideoCompletion(videoServiceTaskId, task.id, task.quality, task.text, task.userId)
 
+    // Step 4: Cleanup temporary audio file if it was generated
+    if (cleanupAudioFile && task.tempAudioFileName) {
+        try {
+            await supabaseAdmin.storage.from("avatar-media").remove([task.tempAudioFileName]);
+            console.log(`[VIDEO_GEN] Cleaned up temp audio: ${task.tempAudioFileName}`);
+        } catch (cleanupError) {
+            console.warn("[VIDEO_GEN] Failed to cleanup temp audio:", cleanupError);
+        }
+    }
+}
+// ------------------------------------------------------------------------------------------------------
+/**
+ * Background function to poll video completion
+ */
+async function _pollVideoCompletion(taskId, videoRecordId, quality, prompt, userId) {
+    const maxAttempts = quality === "high" ? 240 : 120
+    const pollInterval = quality === "high" ? 85000 : 5000 // 8.5seconds : 5 seconds
+    const videoGenBaseUrl = process.env.VIDEO_SERVICE_URL
+
+    console.log(`[VIDEO_GEN] Starting background polling for task ${taskId}`)
+
+    let attempts = 0
+    let videoCompleted = false
+    let videoUrl = null
+
+    while (attempts < maxAttempts && !videoCompleted) {
+        await new Promise((resolve) => setTimeout(resolve, pollInterval))
+        attempts++
+
+        try {
+            const statusResponse = await fetch(`${videoGenBaseUrl}/video-status/${taskId}`, {
+                headers: {
+                    Authorization: generateVideoServiceToken(),
+                },
+            })
+
+            if (statusResponse.ok) {
+                const contentType = statusResponse.headers.get("content-type")
+
+                if (contentType && contentType.includes("video/mp4")) {
+                    console.log(`[VIDEO_GEN] Video ready for task ${taskId}, downloading...`)
+                    const videoBuffer = await statusResponse.arrayBuffer()
+                    
+                    if (videoBuffer.byteLength === 0) {
+                        console.error(`[VIDEO_GEN] Downloaded video is empty for task ${taskId}`)
+                        continue
+                    }
+
+                    const videoFileName = `generated_videos/${videoRecordId}/${quality}-${Date.now()}.mp4`
+                    const { error: videoUploadError } = await supabaseAdmin.storage
+                        .from("avatar-media")
+                        .upload(videoFileName, videoBuffer, { contentType: "video/mp4", upsert: false })
+
+                    if (videoUploadError) {
+                        throw new Error(`Failed to store generated video: ${videoUploadError.message}`)
+                    }
+
+                    const { data: videoUrlData } = supabaseAdmin.storage.from("avatar-media").getPublicUrl(videoFileName)
+                    videoUrl = videoUrlData.publicUrl
+
+                    await supabaseAdmin
+                        .from("video_generation_history")
+                        .update({ video_url: videoUrl, status: "completed", completed_at: new Date().toISOString(), progress: 100 })
+                        .eq("id", videoRecordId)
+
+                    const estimatedDuration = Math.max(0.5, (prompt?.length || 60) * 0.01)
+                    await updateVideoUsage(userId, estimatedDuration)
+
+                    console.log(`[VIDEO_GEN] Video generation completed for task ${taskId}`)
+                    console.log(`[VIDEO_GEN] Video URL: ${videoUrl}`)
+                    videoCompleted = true
+                } else {
+                    const statusResult = await statusResponse.json()
+                    console.log(`[VIDEO_GEN] Task ${taskId} status: ${statusResult.status || "processing"} (attempt ${attempts})`)
+                    if (statusResult.status === "failed") {
+                        throw new Error(`Video generation failed: ${statusResult.error || "Unknown error"}`)
+                    }
+                }
+            } else if (statusResponse.status === 404) {
+                console.log(`[VIDEO_GEN] Task ${taskId} not found (attempt ${attempts})`)
+            } else {
+                console.log(`[VIDEO_GEN] Status check failed for task ${taskId}: ${statusResponse.status} (attempt ${attempts})`)
+            }
+        } catch (pollError) {
+            console.error(`[VIDEO_GEN] Error polling (attempt ${attempts}):`, pollError.message)
+            if (attempts >= maxAttempts) {
+                await supabaseAdmin
+                    .from("video_generation_history")
+                    .update({
+                        status: "failed",
+                        error_message: pollError.message,
+                        completed_at: new Date().toISOString(),
+                    })
+                    .eq("id", videoRecordId)
+            }
+        }
+    }
+
+    if (!videoCompleted) {
+        console.error(`[VIDEO_GEN] Video generation timed out for task ${taskId}`)
+        await supabaseAdmin
+            .from("video_generation_history")
+            .update({
+                status: "failed",
+                error_message: "Video generation timed out",
+                completed_at: new Date().toISOString(),
+            })
+            .eq("id", videoRecordId)
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------
+
+/**
+ * Get video generation status
+ */
 export const getVideoStatus = async (req, res) => {
     const { taskId } = req.params
     const userId = req.user?.id
