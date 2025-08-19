@@ -404,8 +404,8 @@ async function processVideoGeneration(task) {
  * Background function to poll video completion
  */
 async function _pollVideoCompletion(taskId, videoRecordId, quality, prompt, userId) {
-    const maxAttempts = quality === "high" ? 240 : 120
-    const pollInterval = quality === "high" ? 12000 : 5000 // 12seconds : 5 seconds
+    const maxAttempts = quality === "high" ? 1440 : 720
+    const pollInterval = quality === "high" ? 5000 : 5000 // 5seconds : 5 seconds
     const videoGenBaseUrl = process.env.VIDEO_SERVICE_URL
 
     console.log(`[VIDEO_GEN] Starting background polling for task ${taskId}`)
