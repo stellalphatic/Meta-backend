@@ -3,6 +3,8 @@ import conversationRoutes from "./conversationRoutes.js"
 import usageRoutes from "./usageRoutes.js"
 import videoGenerationRoutes from "./videoGenerationRoutes.js"
 import audioGenerationRoutes from "./audioGenerationRoutes.js"
+import apiRoutes from "./apiRoutes.js"
+import publicApiRoutes from "./publicApiRoutes.js"
 
 const router = express.Router()
 
@@ -24,6 +26,9 @@ router.use("/api/conversations", conversationRoutes)
 router.use("/api/usage", usageRoutes)
 router.use("/api/video-generation", videoGenerationRoutes)
 router.use("/api/audio-generation", audioGenerationRoutes)
+
+router.use("/api", apiRoutes)
+router.use("/public-api/v1", publicApiRoutes)
 
 // Root endpoint
 router.get("/", (req, res) => {
