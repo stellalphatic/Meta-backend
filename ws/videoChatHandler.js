@@ -9,90 +9,40 @@ import dotenv from "dotenv"
 
 dotenv.config()
 
-// Helper function to safely parse incoming WebSocket messages
+const videoServiceUrl = process.env.VIDEO_SERVICE_URL || "http://localhost:8000"
+const videoServiceApiKey = process.env.VIDEO_SERVICE_API_KEY
+const videoServiceWsUrl = process.env.VIDEO_SERVICE_WS_URL || "ws://localhost:8000"
+const voiceServiceWsUrl = process.env.VOICE_SERVICE_WS_URL
+const voiceServiceSecretKey = process.env.VOICE_SERVICE_SECRET_KEY
+
+// Helper to safely parse incoming messages
 function parseIncomingMessage(message) {
-  let messageString
   if (typeof message === "string") {
-    messageString = message
-  } else if (message instanceof Buffer || message instanceof ArrayBuffer) {
     try {
-      messageString = Buffer.from(message).toString("utf8")
+      return JSON.parse(message)
     } catch (e) {
-      console.error("Error converting binary message to UTF-8 string:", e)
       return null
     }
-  } else {
-    console.warn("Received unsupported WebSocket message type:", typeof message)
-    return null
   }
-
-  try {
-    const parsed = JSON.parse(messageString)
-    return parsed
-  } catch (e) {
-    return null // Not valid JSON, return null (it might be raw audio or plain text)
-  }
+  return null
 }
 
 async function handleVideoChat(ws, req) {
-  let userId
-  let avatarId
-  let avatarDetails
-  let voiceServiceWs = null
-  let videoServiceWs = null
-  let isSpeaking = false
-  let sessionId
-  let language = "en"
-  let conversationId = null
-  let conversationStartTime = null
+  let userId, avatarId, avatarDetails, voiceServiceWs, videoServiceWs, sessionId, language
   let isFullyConnected = false
   let connectionTimeout = null
+  let conversationStartTime = null
   const chatMessages = []
-
-  // Audio queue management (like your old code)
-  const audioQueue = []
-  let isProcessingAudio = false
-
-  const DEFAULT_LLM_RESPONSE = "I'm having a little trouble with my connection. Could you please repeat that?"
 
   const urlParams = new URLSearchParams(req.url.split("?")[1])
   avatarId = urlParams.get("avatarId")
   const token = urlParams.get("token")
-  let voiceCloneUrl = urlParams.get("voiceUrl")
   language = urlParams.get("language") || "en"
 
   if (!avatarId || !token) {
-    console.error("Missing avatarId or token in WebSocket URL for video chat.")
-    ws.send(
-      JSON.stringify({ type: "error", message: "Video chat initialization failed: Missing avatar info or token." }),
-    )
+    ws.send(JSON.stringify({ type: "error", message: "Initialization failed: Missing avatar info or token." }))
     ws.close()
     return
-  }
-
-  // Audio processing function (based on your old code logic)
-  const processAudioQueue = async () => {
-    if (isProcessingAudio || audioQueue.length === 0) {
-      return
-    }
-
-    isProcessingAudio = true
-
-    while (audioQueue.length > 0) {
-      const audioChunk = audioQueue.shift()
-      try {
-        // Send audio chunk to frontend immediately (no queuing delays)
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(audioChunk)
-        }
-        // Small delay to prevent overwhelming the client
-        await new Promise((resolve) => setTimeout(resolve, 10))
-      } catch (error) {
-        console.error("Error processing audio chunk:", error)
-      }
-    }
-
-    isProcessingAudio = false
   }
 
   try {
@@ -101,496 +51,199 @@ async function handleVideoChat(ws, req) {
     sessionId = crypto.randomUUID()
     conversationStartTime = new Date()
 
-    console.log(
-      `🎥 Real-time video chat initiated for user: ${userId}, session: ${sessionId}, avatar: ${avatarId}, language: ${language}`,
-    )
+    console.log(`🎥 Video chat initiated for user: ${userId}, session: ${sessionId}, avatar: ${avatarId}`)
+    ws.send(JSON.stringify({ type: "connecting", message: "Initializing services..." }))
 
-    // Send connecting status to frontend
-    ws.send(JSON.stringify({ type: "connecting", message: "Connecting to video and voice services..." }))
-
-    // Check conversation limits
-    const { data: profile } = await supabaseAdmin
-      .from("profiles")
-      .select("conversation_minutes_monthly_limit, conversation_minutes_this_month")
-      .eq("id", userId)
-      .single()
-
-    if (profile) {
-      const remainingMinutes =
-        (profile.conversation_minutes_monthly_limit || 0) - (profile.conversation_minutes_this_month || 0)
-      if (remainingMinutes <= 0) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "You have exceeded your monthly conversation limit. Please upgrade your plan to continue.",
-          }),
-        )
-        ws.close()
-        return
-      }
-    }
-
-    // Create conversation record
-    const { data: conversationData, error: conversationError } = await supabaseAdmin
-      .from("conversations")
-      .insert({
-        user_id: userId,
-        avatar_id: avatarId,
-        name: `Video Chat ${new Date().toLocaleDateString()}`,
-        conversation_language: language,
-        audio_only: false,
-        status: "active",
-      })
-      .select()
-      .single()
-
-    if (conversationError) {
-      console.error("Error creating conversation record:", conversationError)
-      ws.send(
-        JSON.stringify({
-          type: "error",
-          message: "Failed to create conversation record. Please try again.",
-        }),
-      )
-      ws.close()
-      return
-    } else {
-      conversationId = conversationData.id
-    }
-
-    // Fetch avatar data
-    console.log(`[DB] Fetching avatar personality data for ${avatarId} from database.`)
     avatarDetails = await getAvatarPersonalityFromDB(avatarId)
-
-    if (!avatarDetails) {
-      console.error("Error loading avatar data for video chat or avatar not found.")
-      await ws.send(JSON.stringify({ type: "error", message: "Avatar not found or error loading data." }))
-      if (conversationId) {
-        await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
-      }
-      ws.close()
-      return
+    if (!avatarDetails || !avatarDetails.image_url || !avatarDetails.voice_url) {
+      const missing = !avatarDetails ? "Avatar not found" : !avatarDetails.image_url ? "image" : "voice"
+      throw new Error(`Avatar configuration incomplete. Missing ${missing}.`)
     }
 
-    console.log(`[DB] Avatar data fetched successfully for ${avatarDetails.name} (ID: ${avatarId})`)
-    console.log(`[DB] Voice URL: ${avatarDetails.voice_url ? "Present" : "Missing"}`)
-
-    // If voiceCloneUrl was NOT provided in the URL, use the one from Supabase
-    if (!voiceCloneUrl) {
-      console.warn("voiceUrl not found in WebSocket URL. Using voice_url from Supabase.")
-      voiceCloneUrl = avatarDetails.voice_url
-    }
-
-    if (!voiceCloneUrl) {
-      console.error("Avatar has no voice sample URL configured for video chat (after checking URL and DB).")
-      await ws.send(
-        JSON.stringify({
-          type: "error",
-          message: `Avatar "${avatarDetails.name}" doesn't have a voice sample configured. Please add a voice sample to this avatar first, or choose a different avatar with voice capabilities.`,
-        }),
-      )
-      if (conversationId) {
-        await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
-      }
-      ws.close()
-      return
-    }
-
-    // Set connection timeout
     connectionTimeout = setTimeout(() => {
       if (!isFullyConnected) {
-        console.error("Video chat services connection timeout")
-        ws.send(JSON.stringify({ type: "error", message: "Connection timeout. Please try again." }))
+        console.error("Connection timeout: One or more services failed to connect in time.")
+        ws.send(JSON.stringify({ type: "error", message: "Connection to avatar services timed out. Please try again." }))
         ws.close()
       }
-    }, 30000) // 30 second timeout for video
+    }, 20000)
 
-    // Step 1: Initialize video service for real-time streaming
-    const videoServiceUrl = process.env.VIDEO_SERVICE_URL || "https://video-service-iiw2y56xsq-as.a.run.app"
-    if (videoServiceUrl) {
-      try {
-        console.log("🎬 Initializing video service for real-time streaming...")
-        // Start video streaming session
-        const initResponse = await fetch(`${videoServiceUrl}/init-stream`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: process.env.VIDEO_SERVICE_API_KEY, // Use direct API key
-          },
-          body: JSON.stringify({
-            avatar_id: avatarId,
-            image_url: avatarDetails.image_url,
-            session_id: sessionId,
+    let isVideoReady = false
+    let isVoiceReady = false
+
+    const checkFullConnection = () => {
+      if (isVideoReady && isVoiceReady && !isFullyConnected) {
+        isFullyConnected = true
+        clearTimeout(connectionTimeout)
+        ws.send(
+          JSON.stringify({
+            type: "ready",
+            message: `Video chat with ${avatarDetails.name} is ready!`,
           }),
-        })
+        )
+        console.log("✅ Video chat fully connected and ready.")
+      }
+    }
 
-        if (initResponse.ok) {
-          console.log("✅ Video streaming session initialized")
-          // Connect to video service WebSocket for real-time frames
-          const videoServiceWsUrl = process.env.VIDEO_SERVICE_WS_URL || "wss://video-service-iiw2y56xsq-as.a.run.app"
-          if (videoServiceWsUrl) {
-            const videoWsUrl = `${videoServiceWsUrl}/stream/${sessionId}`
-            console.log(`🎬 Connecting to video WebSocket: ${videoWsUrl}`)
+    // 1. Initialize and Connect to Video Service
+    ws.send(JSON.stringify({ type: "connecting", message: "Preparing video stream..." }))
+    try {
+      const initResponse = await fetch(`${videoServiceUrl}/init-stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${videoServiceApiKey}`,
+        },
+        body: JSON.stringify({ session_id: sessionId, image_url: avatarDetails.image_url }),
+      })
 
-            videoServiceWs = new WebSocket(videoWsUrl)
-            videoServiceWs.binaryType = "arraybuffer"
+      if (!initResponse.ok) throw new Error(`Video service init failed: ${await initResponse.text()}`)
 
-            videoServiceWs.onopen = () => {
-              console.log("✅ Connected to Video Service WebSocket")
-              // Start idle animation
-              videoServiceWs.send(
-                JSON.stringify({
-                  type: "start_idle_animation",
-                  avatar_id: avatarId,
-                }),
-              )
-            }
+      const videoWsUrl = `${videoServiceWsUrl}/stream/${sessionId}`
+      videoServiceWs = new WebSocket(videoWsUrl)
+      videoServiceWs.binaryType = "arraybuffer"
 
-            videoServiceWs.onmessage = (event) => {
-              // Forward video frames to frontend
-              if (event.data instanceof ArrayBuffer && ws.readyState === WebSocket.OPEN) {
-                ws.send(event.data)
-              } else if (typeof event.data === "string") {
-                const data = JSON.parse(event.data)
-                if (data.type === "frame_ready") {
-                  console.log("📹 Video frame ready")
-                } else if (data.type === "error") {
-                  console.error("❌ Video service error:", data.message)
-                }
-              }
-            }
+      videoServiceWs.onopen = () => {
+        console.log("✅ Connected to Video Service WebSocket.")
+        isVideoReady = true
+        checkFullConnection()
+      }
+      videoServiceWs.onmessage = (event) => {
+        // This is a video frame. Prepend a '2' and forward it to the frontend.
+        if (ws.readyState === WebSocket.OPEN) {
+          const videoHeader = Buffer.from([0x02]) // 0x02 for Video Frame
+          const videoFrame = Buffer.from(event.data)
+          const messageToSend = Buffer.concat([videoHeader, videoFrame])
+          ws.send(messageToSend)
+        }
+      }
+      videoServiceWs.onerror = (error) => console.error("❌ Video Service WebSocket error:", error.message)
+      videoServiceWs.onclose = () => {
+        console.log("🔌 Video Service WebSocket closed.")
+        if (isFullyConnected) ws.close(1011, "Video service disconnected.")
+      }
+    } catch (error) {
+      throw new Error(`Failed to connect to Video Service: ${error.message}`)
+    }
 
-            videoServiceWs.onclose = (event) => {
-              console.log("🔌 Video Service WebSocket closed:", event.code, event.reason)
-            }
+    // 2. Initialize and Connect to Voice Service
+    ws.send(JSON.stringify({ type: "connecting", message: "Preparing voice stream..." }))
+    try {
+      const timestamp = Math.floor(Date.now() / 1000)
+      const signature = crypto.createHmac("sha256", voiceServiceSecretKey).update(`${timestamp}`).digest("hex")
+      const voiceServiceAuthToken = `VOICE_CLONE_AUTH-${Buffer.from(`${signature}.${timestamp}`).toString("base64url")}`
 
-            videoServiceWs.onerror = (error) => {
-              console.error("❌ Video Service WebSocket error:", error)
-            }
+      voiceServiceWs = new WebSocket(voiceServiceWsUrl, { headers: { Authorization: voiceServiceAuthToken } })
+
+      voiceServiceWs.onopen = () => {
+        console.log("✅ Connected to Voice Service WebSocket.")
+        voiceServiceWs.send(
+          JSON.stringify({
+            type: "init",
+            userId: userId,
+            avatarId: avatarId,
+            voice_clone_url: avatarDetails.voice_url,
+            language: language,
+          }),
+        )
+      }
+
+      voiceServiceWs.onmessage = (event) => {
+        const msg = parseIncomingMessage(event.data)
+        if (msg) {
+          if (msg.type === "ready") {
+            console.log("✅ Voice service is ready.")
+            isVoiceReady = true
+            checkFullConnection()
+          } else {
+            ws.send(JSON.stringify(msg))
           }
         } else {
-          console.error("❌ Failed to initialize video streaming session")
-        }
-      } catch (error) {
-        console.error("Error initializing video service:", error)
-      }
-    }
+          // This is a raw audio chunk (Buffer/ArrayBuffer)
+          const audioData = event.data
 
-    // Step 2: Connect to Voice Service
-    const voiceServiceSecretKey = process.env.VOICE_SERVICE_SECRET_KEY
-    if (!voiceServiceSecretKey) {
-      console.error("VOICE_SERVICE_SECRET_KEY environment variable is not set.")
-      ws.send(JSON.stringify({ type: "error", message: "Server configuration error: Voice service key missing." }))
-      if (conversationId) {
-        await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
-      }
-      ws.close()
-      return
-    }
-
-    // Generate the custom auth token for the Python service
-    const timestamp = Math.floor(Date.now() / 1000)
-    const stringToSign = `${timestamp}`
-    const signature = crypto.createHmac("sha256", voiceServiceSecretKey).update(stringToSign).digest("hex")
-    const payload = `${signature}.${timestamp}`
-    const encodedPayload = Buffer.from(payload).toString("base64url")
-    const voiceServiceAuthToken = `VOICE_CLONE_AUTH-${encodedPayload}`
-
-    const voiceServiceWsUrl = process.env.VOICE_SERVICE_WS_URL
-    voiceServiceWs = new WebSocket(voiceServiceWsUrl, {
-      headers: {
-        Authorization: voiceServiceAuthToken,
-      },
-    })
-
-    voiceServiceWs.onopen = async () => {
-      console.log("✅ Connected to Python Voice Service WS for video chat")
-      await voiceServiceWs.send(
-        JSON.stringify({
-          type: "init",
-          userId: userId,
-          avatarId: avatarId,
-          voice_clone_url: voiceCloneUrl,
-          language: language,
-        }),
-      )
-    }
-
-    voiceServiceWs.onmessage = async (event) => {
-      const pythonMessage = parseIncomingMessage(event.data)
-      if (pythonMessage) {
-        if (pythonMessage.type === "ready") {
-          console.log("✅ Python TTS is ready for video chat.")
-          isFullyConnected = true
-          if (connectionTimeout) {
-            clearTimeout(connectionTimeout)
-            connectionTimeout = null
+          // 1. Send audio to the frontend for playback (WITH a header)
+          if (ws.readyState === WebSocket.OPEN) {
+            const audioHeader = Buffer.from([0x01]) // 0x01 for Audio Chunk
+            const audioChunk = Buffer.from(audioData)
+            const messageToSend = Buffer.concat([audioHeader, audioChunk])
+            ws.send(messageToSend)
           }
-          await ws.send(
-            JSON.stringify({
-              type: "ready",
-              message: `Video chat with ${avatarDetails.name} ready!`,
-              avatar: {
-                name: avatarDetails.name,
-                image_url: avatarDetails.image_url,
-              },
-              features: {
-                voice: true,
-                video: !!videoServiceWs,
-                lip_sync: true,
-              },
-            }),
-          )
-        } else if (pythonMessage.type === "error") {
-          await ws.send(JSON.stringify({ type: "error", message: `Voice service error: ${pythonMessage.message}` }))
-          if (conversationId) {
-            await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
-          }
-        } else if (pythonMessage.type === "speech_start") {
-          isSpeaking = true
-          await ws.send(JSON.stringify({ type: "speech_start" }))
-          // Notify video service that speech started
+
+          // 2. Send the SAME RAW audio to the video service for lip-sync (NO header)
           if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-            videoServiceWs.send(JSON.stringify({ type: "speech_start" }))
-          }
-        } else if (pythonMessage.type === "speech_end") {
-          isSpeaking = false
-          await ws.send(JSON.stringify({ type: "speech_end" }))
-          // Notify video service that speech ended
-          if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-            videoServiceWs.send(JSON.stringify({ type: "speech_end" }))
+            videoServiceWs.send(audioData)
           }
         }
-      } else if (event.data instanceof Buffer || event.data instanceof ArrayBuffer) {
-        // Handle raw audio data - use queue system like your old code
-        audioQueue.push(event.data)
-        // Send audio to video service for lip-sync
-        if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-          videoServiceWs.send(event.data) // Send to video service for lip-sync
-        }
-        // Process audio queue for frontend playback
-        if (!isProcessingAudio) {
-          processAudioQueue()
-        }
       }
-    }
-
-    voiceServiceWs.onclose = (event) => {
-      console.log("🔌 Python Voice Service WS closed for video chat.", event.code, event.reason)
-      isSpeaking = false
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "system", message: "Voice service disconnected." }))
-        ws.close(1001, "Python voice service disconnected")
+      voiceServiceWs.onerror = (error) => console.error("❌ Voice Service WebSocket error:", error.message)
+      voiceServiceWs.onclose = () => {
+        console.log("🔌 Voice Service WebSocket closed.")
+        if (isFullyConnected) ws.close(1011, "Voice service disconnected.")
       }
-    }
-
-    voiceServiceWs.onerror = (err) => {
-      console.error("❌ Python Voice Service WS error for video chat:", err)
-      isSpeaking = false
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "error", message: "Voice service connection failed. Please try again." }))
-        ws.close(1011, "Voice service error")
-      }
+    } catch (error) {
+      throw new Error(`Failed to connect to Voice Service: ${error.message}`)
     }
   } catch (error) {
-    console.error("Video chat WebSocket handler initialization error:", error)
-    ws.send(JSON.stringify({ type: "error", message: "Failed to initialize video chat session." }))
-    if (conversationId) {
-      await supabaseAdmin.from("conversations").update({ status: "failed" }).eq("id", conversationId)
-    }
+    console.error("Video chat handler initialization error:", error)
+    ws.send(JSON.stringify({ type: "error", message: error.message || "Failed to initialize video chat session." }))
     ws.close()
     return
   }
 
   ws.on("message", async (message) => {
-    try {
-      const parsedMessage = parseIncomingMessage(message)
-      if (parsedMessage && parsedMessage.type === "user_text") {
-        const userText = parsedMessage.text
-        console.log(`[VIDEO_CHAT] User says: "${userText}"`)
+    if (!isFullyConnected) return
 
-        // Only process if fully connected
-        if (!isFullyConnected) {
-          console.log("[VIDEO_CHAT] Not fully connected yet, ignoring user input")
-          return
-        }
+    const parsedMessage = parseIncomingMessage(message)
+    if (parsedMessage && parsedMessage.type === "user_text") {
+      const userText = parsedMessage.text
+      console.log(`[VIDEO_CHAT] User says: "${userText}"`)
+      chatMessages.push({ role: "user", parts: [{ text: userText }] })
 
-        // Store user message
-        chatMessages.push({ role: "user", parts: [{ text: userText }] })
-
-        if (!userId || !avatarId || !voiceServiceWs || voiceServiceWs.readyState !== WebSocket.OPEN) {
-          console.error("[VIDEO_CHAT] Prerequisites not met to send to LLM. Aborting.")
-          await ws.send(
-            JSON.stringify({
-              type: "error",
-              message: "Video chat not fully initialized or voice service not connected. Please reconnect.",
-            }),
-          )
-          return
-        }
-
-        // Call Gemini for LLM response
-        let llmResponseText
-        if (!userText || userText.trim().length < 2) {
-          llmResponseText = DEFAULT_LLM_RESPONSE
-        } else {
-          llmResponseText = await getGeminiResponse(sessionId, userText, avatarId, language)
-        }
-
+      try {
+        const llmResponseText = await getGeminiResponse(sessionId, userText, avatarId, language)
         console.log(`[VIDEO_CHAT] LLM replies: "${llmResponseText}"`)
-
-        // Store assistant message
         chatMessages.push({ role: "model", parts: [{ text: llmResponseText }] })
 
-        await ws.send(JSON.stringify({ type: "llm_response_text", text: llmResponseText }))
+        ws.send(JSON.stringify({ type: "llm_response_text", text: llmResponseText }))
 
-        if (voiceServiceWs.readyState === WebSocket.OPEN) {
-          console.log("[VIDEO_CHAT] Sending LLM response to Python Voice Service for TTS.")
-          await voiceServiceWs.send(JSON.stringify({ type: "text_to_speak", text: llmResponseText }))
-        } else {
-          console.error("Voice service WebSocket not open, cannot send text for TTS after LLM response.")
-        }
-      } else if (parsedMessage && parsedMessage.type === "stop_speaking") {
         if (voiceServiceWs && voiceServiceWs.readyState === WebSocket.OPEN) {
-          console.log("🛑 Received stop_speaking command from frontend. Forwarding to Python.")
-          voiceServiceWs.send(JSON.stringify({ type: "stop_speaking" }))
+          voiceServiceWs.send(JSON.stringify({ type: "text_to_speak", text: llmResponseText }))
         }
-        // Also stop video service
-        if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-          videoServiceWs.send(JSON.stringify({ type: "stop_speaking" }))
-        }
-        // Clear audio queue
-        audioQueue.length = 0
-        isProcessingAudio = false
-        isSpeaking = false
-        await ws.send(JSON.stringify({ type: "speech_end" }))
+      } catch (e) {
+        console.error("Error getting LLM response or sending to voice service:", e)
+        ws.send(JSON.stringify({ type: "error", message: "There was an issue processing my response." }))
       }
-    } catch (error) {
-      console.error("[VIDEO_CHAT] WebSocket message processing error in main handler:", error)
-      await ws.send(JSON.stringify({ type: "error", message: "Server error processing message." }))
     }
   })
 
   ws.on("close", async () => {
-    console.log("[VIDEO_CHAT] Client disconnected. Cleaning up.")
+    console.log("[VIDEO_CHAT] Client disconnected. Cleaning up all services.")
+    clearTimeout(connectionTimeout)
 
-    // Clear timeout if still active
-    if (connectionTimeout) {
-      clearTimeout(connectionTimeout)
-      connectionTimeout = null
-    }
-
-    // Clear audio queue
-    audioQueue.length = 0
-    isProcessingAudio = false
-
-    // Calculate conversation duration
-    const conversationEndTime = new Date()
-    const durationMinutes = (conversationEndTime - conversationStartTime) / (1000 * 60)
+    if (voiceServiceWs) voiceServiceWs.close()
+    if (videoServiceWs) videoServiceWs.close()
 
     try {
-      // Update conversation record
-      if (conversationId) {
-        // Generate summary using Gemini
-        let summary = ""
-        if (chatMessages.length > 0) {
-          try {
-            const conversationText = chatMessages
-              .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.parts[0].text}`)
-              .join("\n")
-            const summaryPrompt = `Please provide a brief summary of this conversation in 1-2 sentences:\n\n${conversationText}`
-            summary = await getGeminiResponse(`summary-${sessionId}`, summaryPrompt, avatarId, "en")
-          } catch (summaryError) {
-            console.error("Error generating summary:", summaryError)
-            summary = "Video conversation completed successfully."
-          }
-        }
-
-        await supabaseAdmin
-          .from("conversations")
-          .update({
-            status: "ended",
-            updated_at: conversationEndTime.toISOString(),
-          })
-          .eq("id", conversationId)
-
-        // Save chat history
-        if (chatMessages.length > 0) {
-          await supabaseAdmin.from("chat_history").insert({
-            user_id: userId,
-            avatar_id: avatarId,
-            session_id: sessionId,
-            conversation_id: conversationId,
-            chat_messages: chatMessages,
-            started_at: conversationStartTime.toISOString(),
-            ended_at: conversationEndTime.toISOString(),
-            summary: summary,
-          })
-        }
-      }
-
-      // Update usage
-      if (durationMinutes > 0) {
-        await updateConversationUsage(userId, durationMinutes)
-        console.log(`Updated conversation usage for user ${userId}: +${durationMinutes} minutes`)
-      }
+      await fetch(`${videoServiceUrl}/end-stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${videoServiceApiKey}` },
+        body: JSON.stringify({ session_id: sessionId }),
+      })
+      console.log("✅ Video streaming session ended successfully.")
     } catch (error) {
-      console.error("Error saving conversation data:", error)
+      console.error("Error ending video stream session:", error.message)
     }
 
-    // Clean up video service session
-    const videoServiceUrl = process.env.VIDEO_SERVICE_URL || "https://video-service-iiw2y56xsq-as.a.run.app"
-    if (videoServiceUrl) {
-      try {
-        await fetch(`${videoServiceUrl}/end-stream`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: process.env.VIDEO_SERVICE_API_KEY, // Use direct API key
-          },
-          body: JSON.stringify({
-            session_id: sessionId,
-          }),
-        })
-        console.log("✅ Video streaming session ended")
-      } catch (error) {
-        console.error("Error ending video session:", error)
-      }
-    }
-
-    if (voiceServiceWs && voiceServiceWs.readyState === WebSocket.OPEN) {
-      console.log("[VIDEO_CHAT] Closing Python Voice Service WS because client disconnected.")
-      voiceServiceWs.close()
-    }
-
-    if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-      console.log("[VIDEO_CHAT] Closing Video Service WS because client disconnected.")
-      videoServiceWs.close()
+    const durationMinutes = (new Date() - conversationStartTime) / (1000 * 60)
+    if (durationMinutes > 0.1) {
+      await updateConversationUsage(userId, durationMinutes)
     }
   })
 
   ws.on("error", (error) => {
-    console.error("❌ WebSocket error on main video chat connection:", error)
-
-    // Clear timeout if still active
-    if (connectionTimeout) {
-      clearTimeout(connectionTimeout)
-      connectionTimeout = null
-    }
-
-    // Clear audio queue
-    audioQueue.length = 0
-    isProcessingAudio = false
-
-    if (voiceServiceWs && voiceServiceWs.readyState === WebSocket.OPEN) {
-      console.log("[VIDEO_CHAT] Closing Python Voice Service WS due to client error.")
-      voiceServiceWs.close()
-    }
-
-    if (videoServiceWs && videoServiceWs.readyState === WebSocket.OPEN) {
-      console.log("[VIDEO_CHAT] Closing Video Service WS due to client error.")
-      videoServiceWs.close()
-    }
+    console.error("Main WebSocket connection error:", error)
+    ws.close()
   })
 }
 
